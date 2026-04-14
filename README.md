@@ -5,8 +5,8 @@ This README is for iOS teams embedding Ada inside a native app.
 ## Requirements
 
 - iOS 16.0 or newer
-- Swift 5.9 or newer
-- A current Xcode toolchain with Swift 5.9 support
+- Swift 5.9 or newer for source-based installs
+- A current Xcode toolchain for prebuilt XCFramework installs
 - One of:
   - Swift Package Manager
   - CocoaPods
@@ -16,6 +16,10 @@ This README is for iOS teams embedding Ada inside a native app.
 ## Recommended Install Path
 
 Swift Package Manager is the primary installation path going forward.
+
+The published `ada-cx-public/messaging-ios` repository ships source-based installs through Swift Package Manager and CocoaPods, plus prebuilt binary distribution for Carthage and manual `xcframework` installs.
+
+If your team needs the broadest compiler and toolchain compatibility, prefer Swift Package Manager or CocoaPods. Carthage and manual download use the prebuilt XCFramework produced by release CI.
 
 ### Swift Package Manager (SPM)
 
@@ -30,7 +34,7 @@ Xcode:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.0.2"),
+    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.0.3"),
 ],
 targets: [
     .target(
@@ -43,20 +47,20 @@ targets: [
 ### CocoaPods
 
 ```ruby
-pod "AdaMessaging", :git => 'https://github.com/ada-cx-public/messaging-ios', :tag => '1.0.2'
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.0.3"
 ```
 
 ### Carthage
 
 ```ruby
-github "ada-cx-public/messaging-ios" ~> 1.0
+binary "https://raw.githubusercontent.com/ada-cx-public/messaging-ios/main/AdaMessaging.json" ~> 1.0
 ```
 
-Then run `carthage update --use-xcframeworks` and add `AdaMessaging.xcframework` to your app target.
+Then run `carthage update --use-xcframeworks` and add `AdaMessaging.xcframework` from `Carthage/Build` to your app target.
 
 ### Manual XCFramework
 
-Download `AdaMessaging.xcframework.zip` from [ada-cx-public/messaging-ios releases](https://github.com/ada-cx-public/messaging-ios/releases) and embed it in Xcode with `Embed & Sign`.
+Download `AdaMessaging.xcframework.zip` from [ada-cx-public/messaging-ios releases](https://github.com/ada-cx-public/messaging-ios/releases) and embed `AdaMessaging.xcframework` in Xcode with `Embed & Sign`.
 
 ## Quick Start
 
@@ -135,7 +139,7 @@ import AdaMessaging
 pod "AdaEmbedFramework"
 
 # After
-pod "AdaMessaging", :git => 'https://github.com/ada-cx-public/messaging-ios', :tag => '1.0.2'
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.0.3"
 ```
 
 ## Important Code Changes To Make
