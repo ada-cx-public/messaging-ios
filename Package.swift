@@ -7,9 +7,8 @@
 // See README.md for full Swift Package Manager installation instructions.
 //
 // Notes for source distribution:
-// - Storyboard/xib loading falls back to Bundle(for:) — this works correctly
-//   for both manual import and SPM source builds as long as the module bundle
-//   contains the compiled resources.
+// - Storyboard/xib loading uses Bundle.module when built via SwiftPM and falls
+//   back to framework/resource-bundle lookup for CocoaPods and manual imports.
 // - For binary distribution (.xcframework), none of these caveats apply.
 
 import PackageDescription

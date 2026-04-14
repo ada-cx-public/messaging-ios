@@ -31,6 +31,27 @@ public enum AdaWebSdk: String, CaseIterable, Sendable {
     case legacy
 }
 
+enum AdaResourceBundle {
+    static let storyboardName = "AdaWebHostViewController"
+
+    static var current: Bundle {
+#if SWIFT_PACKAGE
+        return .module
+#else
+        let frameworkBundle = Bundle(for: BundleLocator.self)
+
+        if let resourceBundleURL = frameworkBundle.url(forResource: "AdaMessaging", withExtension: "bundle"),
+           let resourceBundle = Bundle(url: resourceBundleURL) {
+            return resourceBundle
+        }
+
+        return frameworkBundle
+#endif
+    }
+
+    private final class BundleLocator {}
+}
+
 @MainActor
 public class AdaWebHost: NSObject {
     public enum AdaWebHostError: Error {

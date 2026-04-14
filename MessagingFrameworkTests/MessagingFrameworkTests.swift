@@ -9,6 +9,7 @@
 @testable import AdaMessaging
 import Foundation
 import Testing
+import UIKit
 import WebKit
 
 // ---------------------------------------------------------------------------
@@ -209,6 +210,27 @@ enum AdaWebHostDefaultsTests {
     static func `defaults to the legacy web runtime`() {
         let host = AdaWebHost(handle: "ada-example")
         #expect(host.webSdk == .legacy)
+    }
+}
+
+@MainActor
+enum AdaResourceLoadingTests {
+    @Test
+    static func `loads web controller storyboard resources`() {
+        let webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let controller = AdaWebHostViewController.createWebController(with: webView)
+
+        #expect(controller.webView === webView)
+    }
+
+    @Test
+    static func `loads offline controller storyboard resources`() throws {
+        let controller = try #require(OfflineViewController.create())
+
+        controller.loadViewIfNeeded()
+
+        #expect(controller.container != nil)
+        #expect(controller.retryButton != nil)
     }
 }
 
