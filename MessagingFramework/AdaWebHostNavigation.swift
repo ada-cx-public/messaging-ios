@@ -71,7 +71,8 @@ extension AdaWebHost: WKNavigationDelegate, WKUIDelegate {
         if #available(iOS 14.5, *), navigationAction.shouldPerformDownload {
             decisionHandler(.download)
         } else if let url = navigationAction.request.url,
-                  url.absoluteString.range(of: "/transcript/") != nil {
+                  url.absoluteString.range(of: "/transcript/") != nil
+        {
             downloadUrl(url: url, fileName: "chat_transcript.txt")
             decisionHandler(.cancel)
         } else if navigationAction.navigationType == WKNavigationType.linkActivated {
@@ -108,7 +109,8 @@ extension AdaWebHost: WKNavigationDelegate, WKUIDelegate {
             if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
                Self.localDevHosts.contains(challenge.protectionSpace.host),
                let trust = challenge.protectionSpace.serverTrust,
-               case .local = (environment ?? .production) {
+               case .local = (environment ?? .production)
+            {
                 completionHandler(.useCredential, URLCredential(trust: trust))
                 return
             }

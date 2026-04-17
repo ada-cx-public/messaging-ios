@@ -21,38 +21,38 @@ import WebKit
 enum AdaBridgeHandlerTests {
     // -----------------------------------------------------------------------
 
-    // MARK: - stripSensitiveKeys
+    // MARK: - stateForPersistence
 
     // -----------------------------------------------------------------------
 
-    struct StripSensitiveKeysTests {
+    struct StateForPersistenceTests {
         @Test
-        func `removes csat.chatterToken`() {
+        func `preserves csat.chatterToken`() {
             let input: [String: Any] = ["csat.chatterToken": "secret", "other": "keep"]
-            let result = AdaBridgeHandler.stripSensitiveKeys(input)
-            #expect(result["csat.chatterToken"] == nil)
+            let result = AdaBridgeHandler.stateForPersistence(input)
+            #expect(result["csat.chatterToken"] as? String == "secret")
             #expect(result["other"] as? String == "keep")
         }
 
         @Test
-        func `removes csat.sessionToken`() {
+        func `preserves csat.sessionToken`() {
             let input: [String: Any] = ["csat.sessionToken": "tok", "name": "Ada"]
-            let result = AdaBridgeHandler.stripSensitiveKeys(input)
-            #expect(result["csat.sessionToken"] == nil)
+            let result = AdaBridgeHandler.stateForPersistence(input)
+            #expect(result["csat.sessionToken"] as? String == "tok")
             #expect(result["name"] as? String == "Ada")
         }
 
         @Test
-        func `preserves non-sensitive keys`() {
+        func `preserves non-session keys`() {
             let input: [String: Any] = ["foo": "bar", "count": 42]
-            let result = AdaBridgeHandler.stripSensitiveKeys(input)
+            let result = AdaBridgeHandler.stateForPersistence(input)
             #expect(result["foo"] as? String == "bar")
             #expect(result["count"] as? Int == 42)
         }
 
         @Test
         func `returns empty dict unchanged`() {
-            let result = AdaBridgeHandler.stripSensitiveKeys([:])
+            let result = AdaBridgeHandler.stateForPersistence([:])
             #expect(result.isEmpty)
         }
     }
@@ -392,15 +392,15 @@ extension AdaBridgeHandlerTests {
         // MARK: sdk.state.cache
 
         @Test
-        func `sdk.state.cache strips sensitive keys before persisting`() throws {
+        func `sdk.state.cache preserves recoverable session keys before persisting`() throws {
             let handler = makeHandler()
             send([
                 "type": "sdk.state.cache",
                 "state": ["botName": "Ada", "csat.chatterToken": "secret", "csat.sessionToken": "tok"],
             ], to: handler)
             let script = try #require(handler.makeInitialStateScript())
-            #expect(!script.source.contains("chatterToken"))
-            #expect(!script.source.contains("sessionToken"))
+            #expect(script.source.contains("chatterToken"))
+            #expect(script.source.contains("sessionToken"))
             #expect(script.source.contains("Ada"))
         }
 
@@ -586,5 +586,78 @@ extension AdaBridgeHandlerTests {
             let script = try #require(webView.capturedScripts.first)
             #expect(script.contains("ada.reset"))
         }
+    }
+}
+
+@MainActor
+enum AdaWebHostBridgeRuntimeTests {
+    @Test
+    static func `bridge runtime queues commands until sdk ready`() throws {
+        let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
+        let webView = ScriptCapturingWebView()
+        host.webView = webView
+        host.webHostLoaded = false
+
+        host.setLanguage(language: "fr")
+
+        #expect(webView.capturedScripts.isEmpty)
+
+        host.webHostLoaded = true
+
+        let script = try #require(webView.capturedScripts.last)
+        #expect(script.contains("ada.setLanguage"))
+        #expect(script.contains("fr"))
+    }
+
+    @Test
+    static func `bridge runtime sends device token only once after a pre-ready update`() {
+        let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
+        let webView = ScriptCapturingWebView()
+        host.webView = webView
+        host.webHostLoaded = false
+
+        host.setDeviceToken(deviceToken: "abc123")
+        #expect(webView.capturedScripts.isEmpty)
+
+        host.adaBridgeDidBecomeReady(AdaBridgeHandler())
+
+        let matchingScripts = webView.capturedScripts.filter { $0.contains("ada.setDeviceToken") }
+        #expect(matchingScripts.count == 1)
+        #expect(matchingScripts[0].contains("abc123"))
+    }
+
+    @Test
+    static func `bridge runtime webview url ignores whitespace-only cluster`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            cluster: "   ",
+            environment: .production,
+            webSdk: .messaging,
+        )
+
+        let url = try #require(host.buildWebviewUrl(environment: .production))
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let clusterQueryItem = components.queryItems?.first(where: { $0.name == "cluster" })
+
+        #expect(clusterQueryItem == nil)
+    }
+}
+
+@MainActor
+enum AdaWebHostLegacyCommandQueueTests {
+    @Test
+    static func `legacy runtime queues commands until the host page is ready`() {
+        let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .legacy)
+        let webView = ScriptCapturingWebView()
+        host.webView = webView
+        host.webHostLoaded = false
+
+        host.setLanguage(language: "fr")
+
+        #expect(webView.capturedScripts.isEmpty)
+
+        host.webHostLoaded = true
+
+        #expect(webView.capturedScripts.contains(where: { $0.contains("adaEmbed.setLanguage") && $0.contains("fr") }))
     }
 }

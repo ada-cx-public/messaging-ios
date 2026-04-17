@@ -7,7 +7,7 @@
 //  Responsibilities:
 //   • Receives `sdk.event`, `sdk.ready`, `sdk.state.cache`, and `sdk.error`
 //     messages posted by the in-WebView bridge adapter script.
-//   • Caches a sanitised state snapshot to UserDefaults so it can be injected
+//   • Caches the latest state snapshot to UserDefaults so it can be injected
 //     back into a new WebView via a WKUserScript at document start, eliminating
 //     the loading spinner on WebView kill-and-restart.
 //   • Sends typed commands to the SDK via evaluateJavaScript without any
@@ -15,8 +15,9 @@
 //     JSON-encoded by the native side before dispatch.
 //
 //  Security notes:
-//   • Sensitive keys (csat.chatterToken, csat.sessionToken) are stripped from
-//     the state before it is persisted to UserDefaults.
+//   • The persisted state cache may contain session credentials and other
+//     sensitive session fields needed for fast rehydration. Clear it on sign-out
+//     or when your app should discard recoverable chat state.
 //   • evaluateJavaScript is called with a fixed template; the JSON payload is
 //     a single argument passed through the window.__ADA_BRIDGE_DISPATCH__ function
 //     which the in-WebView adapter owns and validates.
@@ -80,12 +81,6 @@ import WebKit
     // Private
     // -----------------------------------------------------------------------
 
-    /// State keys that must never be persisted to UserDefaults.
-    private nonisolated static let sensitiveKeys: Set<String> = [
-        "csat.chatterToken",
-        "csat.sessionToken",
-    ]
-
     private let userDefaultsKey = "com.ada.bridge.cachedState"
     private let cachedAtKey = "com.ada.bridge.cachedAt"
     private static let stateCacheTtlSeconds: TimeInterval = 10 * 60 // 10 minutes
@@ -117,13 +112,9 @@ import WebKit
 
     // -----------------------------------------------------------------------
 
-    /// Returns a copy of `state` with all sensitive keys removed.
-    nonisolated static func stripSensitiveKeys(_ state: [String: Any]) -> [String: Any] {
-        var safe = state
-        for key in sensitiveKeys {
-            safe.removeValue(forKey: key)
-        }
-        return safe
+    /// Returns a copy of `state` suitable for persistence.
+    nonisolated static func stateForPersistence(_ state: [String: Any]) -> [String: Any] {
+        state
     }
 
     /// Escapes a JSON string so it is safe to pass as a JS template-literal argument.
@@ -258,7 +249,6 @@ import WebKit
     }
 
     /// Update sensitive meta-fields without resetting the session.
-    /// Sensitive values are never cached by the bridge adapter.
     public func setSensitiveMetaFields(_ fields: [String: Any], to webView: WKWebView) {
         dispatchCommand(
             [
@@ -326,11 +316,11 @@ import WebKit
     // -----------------------------------------------------------------------
 
     private func persistState(_ state: [String: Any]) {
-        let safe = AdaBridgeHandler.stripSensitiveKeys(state)
-        cachedState = safe
+        let persistedState = AdaBridgeHandler.stateForPersistence(state)
+        cachedState = persistedState
         // Serialize to JSON Data so NSNull values (JSON null) are stored correctly.
         // UserDefaults.set(_:forKey:) rejects raw [String: Any] dicts containing NSNull.
-        guard let data = try? JSONSerialization.data(withJSONObject: safe) else { return }
+        guard let data = try? JSONSerialization.data(withJSONObject: persistedState) else { return }
         userDefaults.set(data, forKey: userDefaultsKey)
         userDefaults.set(Date().timeIntervalSince1970, forKey: cachedAtKey)
     }

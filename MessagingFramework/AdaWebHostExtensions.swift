@@ -9,6 +9,21 @@ import WebKit
 // MARK: - Private WebView setup
 
 extension AdaWebHost {
+    func hostTelemetryPayload() -> [String: String] {
+        [
+            "surface": "mobile",
+            "hostPlatform": "ios",
+            "mobilePackage": "messaging-ios",
+            "webSdkOrigin": webSdk.rawValue,
+        ]
+    }
+
+    func hostTelemetryJSONString() -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: hostTelemetryPayload()),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        return json
+    }
+
     func setupWebView() {
         let wkPreferences = WKPreferences()
         wkPreferences.javaScriptCanOpenWindowsAutomatically = true
@@ -58,15 +73,6 @@ extension AdaWebHost {
 
     private func loadInitialRequest(into webView: WKWebView, userContentController: WKUserContentController) {
         if usesBridgeRuntime, let env = environment {
-            if webSdk == .messaging {
-                let bridgeScript = WKUserScript(
-                    source: bridgeAdapterScript,
-                    injectionTime: .atDocumentStart,
-                    forMainFrameOnly: true,
-                )
-                userContentController.addUserScript(bridgeScript)
-            }
-
             userContentController.addUserScript(errorInterceptorScript())
 
             if let url = buildWebviewUrl(environment: env) {
@@ -130,16 +136,17 @@ extension AdaWebHost {
     }
 
     /// Builds the `sdk/webview.html` URL for the given environment, encoding
-    /// the SDK config (handle, cluster, ada_web_sdk, language, greeting, metaFields) as
+    /// the SDK config (handle, cluster, ada_web_sdk, ada_host_telemetry, language, greeting, metaFields) as
     /// URL query parameters.
-    private func buildWebviewUrl(environment: AdaEnvironment) -> URL? {
+    func buildWebviewUrl(environment: AdaEnvironment) -> URL? {
         guard var components = URLComponents(string: environment.webviewHtmlUrl) else { return nil }
 
         var queryItems = [URLQueryItem(name: "handle", value: handle)]
 
         // Use caller-supplied cluster if present, otherwise fall back to the
         // environment's implied cluster (e.g. "localhost" for .local).
-        let effectiveCluster = cluster.isEmpty ? environment.webviewCluster : cluster
+        let trimmedCluster = cluster.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveCluster = trimmedCluster.isEmpty ? environment.webviewCluster : trimmedCluster
         if let effectiveCluster {
             queryItems.append(URLQueryItem(name: "cluster", value: effectiveCluster))
         }
@@ -152,8 +159,12 @@ extension AdaWebHost {
         }
         if !metafields.isEmpty,
            let data = try? JSONSerialization.data(withJSONObject: metafields),
-           let json = String(data: data, encoding: .utf8) {
+           let json = String(data: data, encoding: .utf8)
+        {
             queryItems.append(URLQueryItem(name: "metaFields", value: json))
+        }
+        if let hostTelemetry = hostTelemetryJSONString() {
+            queryItems.append(URLQueryItem(name: "ada_host_telemetry", value: hostTelemetry))
         }
 
         components.queryItems = queryItems

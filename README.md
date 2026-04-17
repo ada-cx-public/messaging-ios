@@ -34,7 +34,7 @@ Xcode:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.0.4"),
+    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.0.5"),
 ],
 targets: [
     .target(
@@ -47,7 +47,7 @@ targets: [
 ### CocoaPods
 
 ```ruby
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.0.4"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.0.5"
 ```
 
 ### Carthage
@@ -139,7 +139,7 @@ import AdaMessaging
 pod "AdaEmbedFramework"
 
 # After
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.0.4"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.0.5"
 ```
 
 ## Important Code Changes To Make

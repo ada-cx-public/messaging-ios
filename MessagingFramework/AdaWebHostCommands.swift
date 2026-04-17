@@ -4,9 +4,25 @@ import WebKit
 // MARK: - Commands
 
 public extension AdaWebHost {
+    private func dispatchBridgeCommandWhenReady(_ action: @escaping (WKWebView) -> Void) {
+        if webHostLoaded, let webView {
+            action(webView)
+            return
+        }
+
+        guard !webHostLoaded else { return }
+
+        pendingCommands.append { [weak self] in
+            guard let webView = self?.webView else { return }
+            action(webView)
+        }
+    }
+
     func setDeviceToken(deviceToken: String) {
         self.deviceToken = deviceToken
         if usesBridgeRuntime {
+            // Before the bridge runtime is ready, keep only the latest token in
+            // host state and let `adaBridgeDidBecomeReady` deliver it once.
             guard webHostLoaded, let webView else { return }
             bridgeHandler.setDeviceToken(deviceToken, to: webView)
             return
@@ -18,13 +34,14 @@ public extension AdaWebHost {
     @available(
         *,
         deprecated,
-        message: "This method will be deprecated in the future, please upgrade to MetaFields.Builder.",
+        message: "Deprecated. Use setMetaFields(builder:) instead.",
         renamed: "setMetaFields(builder:)"
     )
     func setMetaFields(_ fields: [String: Any]) {
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.setMetaFields(fields, to: webView)
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.setMetaFields(fields, to: webView)
+            }
             return
         }
         guard let json = try? JSONSerialization.data(withJSONObject: fields, options: []),
@@ -36,13 +53,14 @@ public extension AdaWebHost {
     @available(
         *,
         deprecated,
-        message: "This method will be deprecated in the future, please upgrade to MetaFields.Builder.",
+        message: "Deprecated. Use setSensitiveMetaFields(builder:) instead.",
         renamed: "setSensitiveMetaFields(builder:)"
     )
     func setSensitiveMetaFields(_ fields: [String: Any]) {
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.setSensitiveMetaFields(fields, to: webView)
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.setSensitiveMetaFields(fields, to: webView)
+            }
             return
         }
         guard let json = try? JSONSerialization.data(withJSONObject: fields, options: []),
@@ -54,8 +72,9 @@ public extension AdaWebHost {
     func setMetaFields(builder: MetaFields.Builder) {
         let metaFields = builder.build().metaFields
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.setMetaFields(metaFields, to: webView)
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.setMetaFields(metaFields, to: webView)
+            }
             return
         }
         guard let json = try? JSONSerialization.data(withJSONObject: metaFields, options: []),
@@ -66,8 +85,9 @@ public extension AdaWebHost {
     func setSensitiveMetaFields(builder: MetaFields.Builder) {
         let metaFields = builder.build().metaFields
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.setSensitiveMetaFields(metaFields, to: webView)
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.setSensitiveMetaFields(metaFields, to: webView)
+            }
             return
         }
         guard let json = try? JSONSerialization.data(withJSONObject: metaFields, options: []),
@@ -76,11 +96,11 @@ public extension AdaWebHost {
     }
 
     /// Re-initialize chat and optionally reset history, language, meta data, etc
-    /// When this method is depreciated, the 4 override reset methods should be replaced
+    /// When this method is deprecated, the 4 override reset methods should be replaced
     @available(
         *,
         deprecated,
-        message: "This method will be deprecated in the future, please upgrade to MetaFields.Builder.",
+        message: "Deprecated. Use reset(metaFields:sensitiveMetaFields:) instead.",
         renamed: "reset(metaFields:sensitiveMetaFields:)"
     )
     func reset(
@@ -91,15 +111,16 @@ public extension AdaWebHost {
         resetChatHistory: Bool? = true,
     ) {
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.reset(
-                language: language,
-                greeting: greeting,
-                metaFields: metaFields,
-                sensitiveMetaFields: sensitiveMetaFields,
-                resetChatHistory: resetChatHistory ?? true,
-                to: webView,
-            )
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.reset(
+                    language: language,
+                    greeting: greeting,
+                    metaFields: metaFields,
+                    sensitiveMetaFields: sensitiveMetaFields,
+                    resetChatHistory: resetChatHistory ?? true,
+                    to: webView,
+                )
+            }
             return
         }
         let data: [String: Any?] = [
@@ -121,15 +142,16 @@ public extension AdaWebHost {
         resetChatHistory: Bool? = true,
     ) {
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.reset(
-                language: language,
-                greeting: greeting,
-                metaFields: metaFields.build().metaFields,
-                sensitiveMetaFields: nil,
-                resetChatHistory: resetChatHistory ?? true,
-                to: webView,
-            )
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.reset(
+                    language: language,
+                    greeting: greeting,
+                    metaFields: metaFields.build().metaFields,
+                    sensitiveMetaFields: nil,
+                    resetChatHistory: resetChatHistory ?? true,
+                    to: webView,
+                )
+            }
             return
         }
         let data: [String: Any?] = [
@@ -151,15 +173,16 @@ public extension AdaWebHost {
         resetChatHistory: Bool? = true,
     ) {
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.reset(
-                language: language,
-                greeting: greeting,
-                metaFields: nil,
-                sensitiveMetaFields: sensitiveMetaFields.build().metaFields,
-                resetChatHistory: resetChatHistory ?? true,
-                to: webView,
-            )
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.reset(
+                    language: language,
+                    greeting: greeting,
+                    metaFields: nil,
+                    sensitiveMetaFields: sensitiveMetaFields.build().metaFields,
+                    resetChatHistory: resetChatHistory ?? true,
+                    to: webView,
+                )
+            }
             return
         }
         let data: [String: Any?] = [
@@ -182,15 +205,16 @@ public extension AdaWebHost {
         resetChatHistory: Bool? = true,
     ) {
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.reset(
-                language: language,
-                greeting: greeting,
-                metaFields: metaFields.build().metaFields,
-                sensitiveMetaFields: sensitiveMetaFields.build().metaFields,
-                resetChatHistory: resetChatHistory ?? true,
-                to: webView,
-            )
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.reset(
+                    language: language,
+                    greeting: greeting,
+                    metaFields: metaFields.build().metaFields,
+                    sensitiveMetaFields: sensitiveMetaFields.build().metaFields,
+                    resetChatHistory: resetChatHistory ?? true,
+                    to: webView,
+                )
+            }
             return
         }
         let data: [String: Any?] = [
@@ -207,13 +231,14 @@ public extension AdaWebHost {
 
     func reset(language: String? = nil, greeting: String? = nil, resetChatHistory: Bool? = true) {
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.reset(
-                language: language,
-                greeting: greeting,
-                resetChatHistory: resetChatHistory ?? true,
-                to: webView,
-            )
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.reset(
+                    language: language,
+                    greeting: greeting,
+                    resetChatHistory: resetChatHistory ?? true,
+                    to: webView,
+                )
+            }
             return
         }
         let data: [String: Any?] = [
@@ -231,8 +256,9 @@ public extension AdaWebHost {
     /// Re-initialize chat and optionally reset history, language, meta data, etc
     func deleteHistory() {
         if usesBridgeRuntime {
-            guard webHostLoaded, let webView else { return }
-            bridgeHandler.deleteHistory(to: webView)
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+                bridgeHandler.deleteHistory(to: webView)
+            }
             return
         }
         evalJS("adaEmbed.deleteHistory();")
@@ -240,41 +266,21 @@ public extension AdaWebHost {
 
     func triggerAnswer(answerId: String) {
         if usesBridgeRuntime {
-            if webHostLoaded {
-                guard let webView else { return }
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.triggerAnswer(responseId: answerId, to: webView)
-                return
             }
-
-            debugPrint("AdaWebHost.triggerAnswer failed, webView needs to be initialized.")
             return
         }
-
-        if webHostLoaded {
-            evalJS("adaEmbed.triggerAnswer(\(jsonStr(answerId)));")
-            return
-        }
-
-        debugPrint("AdaWebHost.triggerAnswer failed, webView needs to be initialized.")
+        evalJS("adaEmbed.triggerAnswer(\(jsonStr(answerId)));")
     }
 
     func setLanguage(language: String) {
         if usesBridgeRuntime {
-            if webHostLoaded {
-                guard let webView else { return }
+            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.setLanguage(language, to: webView)
-                return
             }
-
-            debugPrint("AdaWebHost.setLanguage failed, webView needs to be initialized.")
             return
         }
-
-        if webHostLoaded {
-            evalJS("adaEmbed.setLanguage(\(jsonStr(language)));")
-            return
-        }
-
-        debugPrint("AdaWebHost.setLanguage failed, webView needs to be initialized.")
+        evalJS("adaEmbed.setLanguage(\(jsonStr(language)));")
     }
 }

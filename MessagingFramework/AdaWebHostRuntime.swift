@@ -12,7 +12,8 @@ extension AdaWebHost: WKScriptMessageHandler {
         if messageName == "embedReady" {
             webHostLoaded = true
         } else if let webViewLoadingErrorCallback,
-                  messageName == "chatFrameTimeoutCallbackHandler" {
+                  messageName == "chatFrameTimeoutCallbackHandler"
+        {
             webViewLoadingErrorCallback(AdaWebHostError.webViewTimeout)
         } else if let zdChatterAuthCallback, messageName == "zdChatterAuthCallbackHandler" {
             zdChatterAuthCallback { token in
@@ -21,9 +22,11 @@ extension AdaWebHost: WKScriptMessageHandler {
                 self.evalJS("if(window.zdTokenCallback){window.zdTokenCallback(\(tokenJson));}")
             }
         } else if messageName == "eventCallbackHandler",
-                  let event = message.body as? [String: Any] {
+                  let event = message.body as? [String: Any]
+        {
             if let eventName = event["event_name"] as? String,
-               let specificCallback = eventCallbacks?[eventName] {
+               let specificCallback = eventCallbacks?[eventName]
+            {
                 specificCallback(event)
             }
 
@@ -44,6 +47,7 @@ extension AdaWebHost {
 
             let sensitiveMetaFieldsData = try JSONSerialization.data(withJSONObject: sensitiveMetafields, options: [])
             let sensitiveMetaFieldsJson = String(data: sensitiveMetaFieldsData, encoding: .utf8) ?? "{}"
+            let hostTelemetryJson = hostTelemetryJSONString() ?? "{}"
 
             // JSON-encode all developer-supplied string config values so that
             // characters like `"`, `\`, and newlines can't break the JS context.
@@ -66,6 +70,7 @@ extension AdaWebHost {
                         styles: \(stylesJson),
                         greeting: \(greetingJson),
                         metaFields: \(metaFieldsJson),
+                        hostTelemetry: \(hostTelemetryJson),
                         sensitiveMetaFields: \(sensitiveMetaFieldsJson),
                         parentElement: "parent-element",
                         onAdaEmbedLoaded: () => {
@@ -101,7 +106,9 @@ extension AdaWebHost {
 
     func evalJS(_ toRun: String) {
         guard webHostLoaded else {
-            pendingCommands.append(toRun)
+            pendingCommands.append { [weak self] in
+                self?.evalJS(toRun)
+            }
             return
         }
         guard let webView else { return }

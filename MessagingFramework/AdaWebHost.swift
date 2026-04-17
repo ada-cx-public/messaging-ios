@@ -35,18 +35,19 @@ enum AdaResourceBundle {
     static let storyboardName = "AdaWebHostViewController"
 
     static var current: Bundle {
-#if SWIFT_PACKAGE
-        return .module
-#else
-        let frameworkBundle = Bundle(for: BundleLocator.self)
+        #if SWIFT_PACKAGE
+            return .module
+        #else
+            let frameworkBundle = Bundle(for: BundleLocator.self)
 
-        if let resourceBundleURL = frameworkBundle.url(forResource: "AdaMessaging", withExtension: "bundle"),
-           let resourceBundle = Bundle(url: resourceBundleURL) {
-            return resourceBundle
-        }
+            if let resourceBundleURL = frameworkBundle.url(forResource: "AdaMessaging", withExtension: "bundle"),
+               let resourceBundle = Bundle(url: resourceBundleURL)
+            {
+                return resourceBundle
+            }
 
-        return frameworkBundle
-#endif
+            return frameworkBundle
+        #endif
     }
 
     private final class BundleLocator {}
@@ -127,11 +128,10 @@ public class AdaWebHost: NSObject {
                 if usesLegacyRemoteHostPage {
                     // Legacy path: call adaEmbed.start() once the remote page is ready.
                     initializeWebView()
-                    for command in pendingCommands {
-                        evalJS(command)
-                    }
                 }
+                let commands = pendingCommands
                 pendingCommands.removeAll()
+                commands.forEach { $0() }
             }
         }
     }
@@ -140,7 +140,7 @@ public class AdaWebHost: NSObject {
     var isInOfflineMode = false
 
     /// Commands queued while the SDK is not yet ready, flushed once sdk.ready fires.
-    var pendingCommands = [String]()
+    var pendingCommands = [() -> Void]()
 
     /// Bridge handler for state caching and injection-safe command dispatch.
     let bridgeHandler = AdaBridgeHandler()
