@@ -109,6 +109,20 @@ public class AdaWebHost: NSObject {
     /// Selects which web runtime the native WebView should mount.
     public var webSdk: AdaWebSdk = .legacy
 
+    /// Pins the legacy remote host page (`/mobile-sdk-webview/`) to a specific
+    /// embed-2 build. Rendered as the `?__ada-embed-version=<sha>` query param
+    /// (read by `embed-loader`). Used for PR verification; leave blank for the
+    /// stable rollout. Ignored when `webSdk != .legacy` or for the local-legacy
+    /// bridge runtime.
+    public var embedVersion: String = ""
+
+    /// Pins the legacy remote host page to a specific chat build. Rendered as
+    /// the `?__ada-chat-version=<sha>` query param (read by `embed-2`'s
+    /// chat-versioning). Used for PR verification; leave blank for the stable
+    /// rollout. Ignored when `webSdk != .legacy` or for the local-legacy bridge
+    /// runtime.
+    public var version: String = ""
+
     /// Here's where we do our business
     var webView: WKWebView?
 
@@ -190,6 +204,8 @@ public class AdaWebHost: NSObject {
         navigationBarOpaqueBackground: Bool = false,
         environment: AdaEnvironment? = nil,
         webSdk: AdaWebSdk = .legacy,
+        embedVersion: String = "",
+        version: String = "",
     ) {
         self.handle = handle
         self.cluster = cluster
@@ -213,6 +229,8 @@ public class AdaWebHost: NSObject {
         self.navigationBarOpaqueBackground = navigationBarOpaqueBackground
         self.environment = environment
         self.webSdk = webSdk
+        self.embedVersion = embedVersion
+        self.version = version
 
         reachability = Reachability()
         super.init()

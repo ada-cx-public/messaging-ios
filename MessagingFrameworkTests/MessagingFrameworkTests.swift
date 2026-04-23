@@ -12,6 +12,23 @@ import Testing
 import UIKit
 import WebKit
 
+private let semverPattern = #"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$"#
+
+private func packageVersionFromSourceCheckout(filePath: String = #filePath) -> String? {
+    let testsDirectory = URL(fileURLWithPath: filePath).deletingLastPathComponent()
+    let iosDirectory = testsDirectory.deletingLastPathComponent()
+    let packageManifestPath = iosDirectory.appendingPathComponent("package.json")
+
+    guard let data = try? Data(contentsOf: packageManifestPath),
+          let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let version = manifest["version"] as? String
+    else {
+        return nil
+    }
+
+    return version
+}
+
 // ---------------------------------------------------------------------------
 
 // MARK: - AdaBridgeHandlerTests
@@ -210,6 +227,31 @@ enum AdaWebHostDefaultsTests {
     static func `defaults to the legacy web runtime`() {
         let host = AdaWebHost(handle: "ada-example")
         #expect(host.webSdk == .legacy)
+    }
+
+    @Test
+    static func `host telemetry includes the framework semver version`() {
+        let host = AdaWebHost(handle: "ada-example")
+        let payload = host.hostTelemetryPayload()
+        let actualVersion = payload["mobileVersion"]
+        let expectedVersion = ProcessInfo.processInfo.environment["ADA_MESSAGING_PACKAGE_VERSION"] ??
+            packageVersionFromSourceCheckout()
+
+        #expect(payload["mobilePackage"] == "messaging-ios")
+
+        // `mobileVersion` is sourced from `CFBundleShortVersionString`, which is
+        // only populated when `AdaWebHost` is loaded from a framework bundle
+        // (xcodeproj build, xcframework, CocoaPods). SwiftPM-built test bundles
+        // resolve `Bundle(for:)` to a module whose Info.plist does not expose
+        // the framework's marketing version, so `actualVersion` is nil in that
+        // context and the regex/equality assertions are skipped. The framework
+        // path is covered by the xcodeproj test run in CI.
+        if let actualVersion {
+            #expect(actualVersion.range(of: semverPattern, options: .regularExpression) != nil)
+            if let expectedVersion {
+                #expect(actualVersion == expectedVersion)
+            }
+        }
     }
 }
 

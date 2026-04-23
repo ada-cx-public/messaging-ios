@@ -9,13 +9,36 @@ import WebKit
 // MARK: - Private WebView setup
 
 extension AdaWebHost {
+    private static let frameworkSemver: String? = {
+        let bundle = Bundle(for: AdaWebHost.self)
+        guard let rawVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else {
+            return nil
+        }
+
+        let trimmedVersion = rawVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedVersion.isEmpty else {
+            return nil
+        }
+
+        let semverPattern = #"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$"#
+        return trimmedVersion.range(of: semverPattern, options: .regularExpression) != nil
+            ? trimmedVersion
+            : nil
+    }()
+
     func hostTelemetryPayload() -> [String: String] {
-        [
+        var payload = [
             "surface": "mobile",
             "hostPlatform": "ios",
             "mobilePackage": "messaging-ios",
             "webSdkOrigin": webSdk.rawValue,
         ]
+
+        if let frameworkSemver = Self.frameworkSemver {
+            payload["mobileVersion"] = frameworkSemver
+        }
+
+        return payload
     }
 
     func hostTelemetryJSONString() -> String? {
@@ -41,6 +64,17 @@ extension AdaWebHost {
         webView.scrollView.isScrollEnabled = false
         webView.navigationDelegate = self
         webView.uiDelegate = self
+
+        #if DEBUG
+        // Lets Safari's Web Inspector attach to the WebView on debug SDK builds.
+        // Requires `DEBUG` in `SWIFT_ACTIVE_COMPILATION_CONDITIONS` for the
+        // framework's Debug config (set in AdaMessaging.xcodeproj). Release
+        // builds never get this.
+        if #available(iOS 16.4, *) {
+            webView.isInspectable = true
+        }
+        #endif
+
         loadInitialRequest(into: webView, userContentController: userContentController)
 
         let timeout = webViewTimeout
@@ -195,7 +229,24 @@ extension AdaWebHost {
             }
         }
 
-        return URL(string: "https://\(host)/mobile-sdk-webview/")
+        guard var components = URLComponents(string: "https://\(host)/mobile-sdk-webview/") else { return nil }
+
+        let trimmedEmbedVersion = embedVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedVersion = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        var queryItems: [URLQueryItem] = []
+        if !trimmedEmbedVersion.isEmpty {
+            // Read by embed-loader → pins embed-2 to the given SHA.
+            queryItems.append(URLQueryItem(name: "__ada-embed-version", value: trimmedEmbedVersion))
+        }
+        if !trimmedVersion.isEmpty {
+            // Read by embed-2's chat-versioning → pins the chat bundle to the given SHA.
+            queryItems.append(URLQueryItem(name: "__ada-chat-version", value: trimmedVersion))
+        }
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
+        }
+
+        return components.url
     }
 
     func legacyEmbedStartConfig() -> (cluster: String, domain: String) {
