@@ -269,11 +269,6 @@ import WebKit
         dispatchCommand(["type": "ada.setLanguage", "payload": ["language": language]], to: webView)
     }
 
-    /// Trigger a scripted answer by response ID.
-    public func triggerAnswer(responseId: String, to webView: WKWebView) {
-        dispatchCommand(["type": "ada.triggerAnswer", "payload": ["responseId": responseId]], to: webView)
-    }
-
     /// Delete chat history and reset the session.
     public func deleteHistory(to webView: WKWebView) {
         dispatchCommand(["type": "ada.deleteHistory"], to: webView)

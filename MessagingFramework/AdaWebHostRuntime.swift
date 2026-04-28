@@ -171,6 +171,11 @@ extension AdaWebHost: AdaBridgeDelegate {
     /// Called when the Ada SDK signals it is ready to accept commands (new bridge path).
     public func adaBridgeDidBecomeReady(_: AdaBridgeHandler) {
         webHostLoaded = true
+        if let callbacks = eventCallbacks {
+            let event: [String: Any] = ["event_name": "sdk.ready", "web_sdk": webSdk.rawValue]
+            callbacks["sdk.ready"]?(event)
+            callbacks["*"]?(event)
+        }
         // Send device token once SDK is ready (pending commands are flushed by webHostLoaded didSet).
         if !deviceToken.isEmpty, let webView {
             bridgeHandler.setDeviceToken(deviceToken, to: webView)

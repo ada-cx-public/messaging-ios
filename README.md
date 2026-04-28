@@ -4,7 +4,7 @@ This README is for iOS teams embedding Ada inside a native app.
 
 ## Requirements
 
-- iOS 16.0 or newer
+- iOS 15.0 or newer
 - Swift 5.9 or newer for source-based installs
 - A current Xcode toolchain for prebuilt XCFramework installs
 - One of:
@@ -34,7 +34,7 @@ Xcode:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.0.6"),
+    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.1.0"),
 ],
 targets: [
     .target(
@@ -47,7 +47,7 @@ targets: [
 ### CocoaPods
 
 ```ruby
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.0.6"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.1.0"
 ```
 
 ### Carthage
@@ -96,7 +96,6 @@ let sensitive = MetaFields.Builder()
 adaWebHost.setSensitiveMetaFields(builder: sensitive)
 adaWebHost.setDeviceToken(deviceToken: "apns-device-token")
 adaWebHost.setLanguage(language: "fr")
-adaWebHost.triggerAnswer(answerId: "response-id")
 adaWebHost.reset(language: "en", resetChatHistory: true)
 adaWebHost.deleteHistory()
 ```
@@ -139,7 +138,7 @@ import AdaMessaging
 pod "AdaEmbedFramework"
 
 # After
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.0.6"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.1.0"
 ```
 
 ## Important Code Changes To Make

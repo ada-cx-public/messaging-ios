@@ -123,6 +123,10 @@ public class AdaWebHost: NSObject {
     /// runtime.
     public var version: String = ""
 
+    /// Time-bound demo access token for Messaging preprod assets. Applied only
+    /// when `environment` is `.preprod` and `webSdk` is `.messaging`.
+    public var preprodDemoToken: String = ""
+
     /// Here's where we do our business
     var webView: WKWebView?
 
@@ -206,6 +210,7 @@ public class AdaWebHost: NSObject {
         webSdk: AdaWebSdk = .legacy,
         embedVersion: String = "",
         version: String = "",
+        preprodDemoToken: String = "",
     ) {
         self.handle = handle
         self.cluster = cluster
@@ -231,6 +236,7 @@ public class AdaWebHost: NSObject {
         self.webSdk = webSdk
         self.embedVersion = embedVersion
         self.version = version
+        self.preprodDemoToken = preprodDemoToken
 
         reachability = Reachability()
         super.init()

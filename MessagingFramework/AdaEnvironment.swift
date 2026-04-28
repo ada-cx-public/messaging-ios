@@ -112,6 +112,19 @@ public enum AdaEnvironment: Equatable {
         }
     }
 
+    var webviewEdgeCluster: String? {
+        switch self {
+        case .production:
+            "ada.support"
+        case .preprod:
+            "ada-dev2.support"
+        case .local:
+            "localhost"
+        case .custom:
+            nil
+        }
+    }
+
     var cspConnectSrc: String {
         switch self {
         case .production:

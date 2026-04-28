@@ -264,16 +264,6 @@ public extension AdaWebHost {
         evalJS("adaEmbed.deleteHistory();")
     }
 
-    func triggerAnswer(answerId: String) {
-        if usesBridgeRuntime {
-            dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
-                bridgeHandler.triggerAnswer(responseId: answerId, to: webView)
-            }
-            return
-        }
-        evalJS("adaEmbed.triggerAnswer(\(jsonStr(answerId)));")
-    }
-
     func setLanguage(language: String) {
         if usesBridgeRuntime {
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in

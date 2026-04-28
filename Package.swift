@@ -17,7 +17,7 @@ let package = Package(
 	name: "AdaMessaging",
 	defaultLocalization: "en",
 	platforms: [
-		.iOS(.v16),
+		.iOS(.v15),
 	],
 	products: [
 		.library(

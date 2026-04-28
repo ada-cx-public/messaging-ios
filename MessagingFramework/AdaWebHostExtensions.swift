@@ -9,6 +9,8 @@ import WebKit
 // MARK: - Private WebView setup
 
 extension AdaWebHost {
+    private static let preprodMessagingReferer = "https://messaging-demo.ada-dev2.support/"
+
     private static let frameworkSemver: String? = {
         let bundle = Bundle(for: AdaWebHost.self)
         guard let rawVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else {
@@ -66,26 +68,43 @@ extension AdaWebHost {
         webView.uiDelegate = self
 
         #if DEBUG
-        // Lets Safari's Web Inspector attach to the WebView on debug SDK builds.
-        // Requires `DEBUG` in `SWIFT_ACTIVE_COMPILATION_CONDITIONS` for the
-        // framework's Debug config (set in AdaMessaging.xcodeproj). Release
-        // builds never get this.
-        if #available(iOS 16.4, *) {
-            webView.isInspectable = true
-        }
+            // Lets Safari's Web Inspector attach to the WebView on debug SDK builds.
+            // Requires `DEBUG` in `SWIFT_ACTIVE_COMPILATION_CONDITIONS` for the
+            // framework's Debug config (set in AdaMessaging.xcodeproj). Release
+            // builds never get this.
+            if #available(iOS 16.4, *) {
+                webView.isInspectable = true
+            }
         #endif
 
         loadInitialRequest(into: webView, userContentController: userContentController)
 
         let timeout = webViewTimeout
         Task { @MainActor [weak self, webView] in
-            try? await Task.sleep(for: .seconds(timeout))
+            do {
+                try await Self.sleepForWebViewTimeout(timeout)
+            } catch {
+                return
+            }
+
             guard let self else { return }
             if !hasError, webView.isLoading {
                 webView.stopLoading()
                 webViewLoadingErrorCallback?(AdaWebHostError.webViewTimeout)
             }
         }
+    }
+
+    private static func sleepForWebViewTimeout(_ timeout: TimeInterval) async throws {
+        if #available(iOS 16.0, *) {
+            try await Task.sleep(for: .seconds(timeout))
+        } else {
+            try await Task.sleep(nanoseconds: secondsToNanoseconds(timeout))
+        }
+    }
+
+    private static func secondsToNanoseconds(_ seconds: TimeInterval) -> UInt64 {
+        UInt64((max(0, seconds) * 1_000_000_000).rounded())
     }
 
     private func registerMessageHandlers(on userContentController: WKUserContentController) {
@@ -110,7 +129,9 @@ extension AdaWebHost {
             userContentController.addUserScript(errorInterceptorScript())
 
             if let url = buildWebviewUrl(environment: env) {
-                webView.load(URLRequest(url: url))
+                setPreprodDemoCookieIfNeeded(environment: env, in: webView) {
+                    webView.load(self.buildWebviewRequest(url: url, environment: env))
+                }
             }
             return
         }
@@ -122,6 +143,41 @@ extension AdaWebHost {
             timeoutInterval: webViewTimeout,
         )
         webView.load(webRequest)
+    }
+
+    private func setPreprodDemoCookieIfNeeded(
+        environment: AdaEnvironment,
+        in webView: WKWebView,
+        completion: @escaping @MainActor @Sendable () -> Void,
+    ) {
+        let trimmedToken = preprodDemoToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard webSdk == .messaging,
+              case .preprod = environment,
+              !trimmedToken.isEmpty
+        else {
+            completion()
+            return
+        }
+
+        let cookieProperties: [HTTPCookiePropertyKey: Any] = [
+            .domain: "messaging-assets.ada-dev2.support",
+            .path: "/",
+            .name: "ada_demo_token",
+            .value: trimmedToken,
+            .secure: "TRUE",
+        ]
+        guard let cookie = HTTPCookie(properties: cookieProperties) else {
+            completion()
+            return
+        }
+
+        webView.configuration.websiteDataStore.httpCookieStore.setCookie(
+            cookie,
+        ) {
+            Task { @MainActor in
+                completion()
+            }
+        }
     }
 
     private func errorInterceptorScript() -> WKUserScript {
@@ -165,8 +221,20 @@ extension AdaWebHost {
         return WKUserScript(
             source: source,
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: false,
+            forMainFrameOnly: true,
         )
+    }
+
+    func buildWebviewRequest(url: URL, environment: AdaEnvironment) -> URLRequest {
+        var request = URLRequest(url: url)
+        if webSdk == .messaging, case .preprod = environment {
+            request.setValue(Self.preprodMessagingReferer, forHTTPHeaderField: "Referer")
+            let trimmedToken = preprodDemoToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedToken.isEmpty {
+                request.setValue("ada_demo_token=\(trimmedToken)", forHTTPHeaderField: "Cookie")
+            }
+        }
+        return request
     }
 
     /// Builds the `sdk/webview.html` URL for the given environment, encoding
@@ -175,14 +243,21 @@ extension AdaWebHost {
     func buildWebviewUrl(environment: AdaEnvironment) -> URL? {
         guard var components = URLComponents(string: environment.webviewHtmlUrl) else { return nil }
 
-        var queryItems = [URLQueryItem(name: "handle", value: handle)]
+        var queryItems = [
+            URLQueryItem(name: "handle", value: handle),
+            URLQueryItem(name: "ada_handle", value: handle),
+        ]
 
         // Use caller-supplied cluster if present, otherwise fall back to the
         // environment's implied cluster (e.g. "localhost" for .local).
         let trimmedCluster = cluster.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveCluster = trimmedCluster.isEmpty ? environment.webviewCluster : trimmedCluster
+        let edgeCluster = effectiveCluster ?? environment.webviewEdgeCluster
         if let effectiveCluster {
             queryItems.append(URLQueryItem(name: "cluster", value: effectiveCluster))
+        }
+        if let edgeCluster {
+            queryItems.append(URLQueryItem(name: "ada_cluster", value: edgeCluster))
         }
         queryItems.append(URLQueryItem(name: "ada_web_sdk", value: webSdk.rawValue))
         if !language.isEmpty {

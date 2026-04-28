@@ -284,6 +284,7 @@ enum AdaEnvironmentTests {
         #expect(environment.sdkUrl == "https://localhost:4900/sdk/index.js")
         #expect(environment.webviewHtmlUrl == "https://localhost:4900/sdk/webview.html")
         #expect(environment.webviewCluster == "localhost")
+        #expect(environment.webviewEdgeCluster == "localhost")
         #expect(environment.cspConnectSrc == "https://localhost:4900 https: wss:")
     }
 
@@ -591,16 +592,6 @@ extension AdaBridgeHandlerTests {
         }
 
         @Test
-        func `triggerAnswer convenience method emits correct type and responseId`() throws {
-            let handler = makeHandler()
-            let webView = ScriptCapturingWebView()
-            handler.triggerAnswer(responseId: "resp-1", to: webView)
-            let script = try #require(webView.capturedScripts.first)
-            #expect(script.contains("ada.triggerAnswer"))
-            #expect(script.contains("resp-1"))
-        }
-
-        @Test
         func `deleteHistory convenience method emits correct type`() throws {
             let handler = makeHandler()
             let webView = ScriptCapturingWebView()
@@ -669,6 +660,23 @@ enum AdaWebHostBridgeRuntimeTests {
     }
 
     @Test
+    static func `bridge runtime surfaces sdk ready through event callbacks`() throws {
+        var receivedEvents: [[String: Any]] = []
+        let host = AdaWebHost(
+            handle: "ada-example",
+            eventCallbacks: ["*": { event in receivedEvents.append(event) }],
+            environment: .production,
+            webSdk: .messaging,
+        )
+
+        host.adaBridgeDidBecomeReady(AdaBridgeHandler())
+
+        let event = try #require(receivedEvents.first)
+        #expect(event["event_name"] as? String == "sdk.ready")
+        #expect(event["web_sdk"] as? String == AdaWebSdk.messaging.rawValue)
+    }
+
+    @Test
     static func `bridge runtime webview url ignores whitespace-only cluster`() throws {
         let host = AdaWebHost(
             handle: "ada-example",
@@ -680,8 +688,59 @@ enum AdaWebHostBridgeRuntimeTests {
         let url = try #require(host.buildWebviewUrl(environment: .production))
         let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
         let clusterQueryItem = components.queryItems?.first(where: { $0.name == "cluster" })
+        let edgeClusterQueryItem = components.queryItems?.first(where: { $0.name == "ada_cluster" })
 
         #expect(clusterQueryItem == nil)
+        #expect(edgeClusterQueryItem?.value == "ada.support")
+    }
+
+    @Test
+    static func `bridge runtime webview url excludes preprod demo token for messaging preprod`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            environment: .preprod(branch: "feature-x"),
+            webSdk: .messaging,
+            preprodDemoToken: "demo-token",
+        )
+
+        let url = try #require(host.buildWebviewUrl(environment: .preprod(branch: "feature-x")))
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let demoToken = components.queryItems?.first(where: { $0.name == "ada_demo_token" })?.value
+        let edgeHandle = components.queryItems?.first(where: { $0.name == "ada_handle" })?.value
+        let edgeCluster = components.queryItems?.first(where: { $0.name == "ada_cluster" })?.value
+
+        #expect(demoToken == nil)
+        #expect(edgeHandle == "ada-example")
+        #expect(edgeCluster == "ada-dev2.support")
+    }
+
+    @Test
+    static func `bridge runtime preprod messaging request sends demo auth headers`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            environment: .preprod(branch: "feature-x"),
+            webSdk: .messaging,
+            preprodDemoToken: "demo-token",
+        )
+        let url = try #require(host.buildWebviewUrl(environment: .preprod(branch: "feature-x")))
+        let request = host.buildWebviewRequest(url: url, environment: .preprod(branch: "feature-x"))
+
+        #expect(request.value(forHTTPHeaderField: "Referer") == "https://messaging-demo.ada-dev2.support/")
+        #expect(request.value(forHTTPHeaderField: "Cookie") == "ada_demo_token=demo-token")
+    }
+
+    @Test
+    static func `bridge runtime request skips demo host referer outside preprod messaging`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            environment: .production,
+            webSdk: .messaging,
+        )
+        let url = try #require(host.buildWebviewUrl(environment: .production))
+        let request = host.buildWebviewRequest(url: url, environment: .production)
+
+        #expect(request.value(forHTTPHeaderField: "Referer") == nil)
+        #expect(request.value(forHTTPHeaderField: "Cookie") == nil)
     }
 }
 
