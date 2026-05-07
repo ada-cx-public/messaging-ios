@@ -11,23 +11,6 @@ import WebKit
 extension AdaWebHost {
     private static let preprodMessagingReferer = "https://messaging-demo.ada-dev2.support/"
 
-    private static let frameworkSemver: String? = {
-        let bundle = Bundle(for: AdaWebHost.self)
-        guard let rawVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else {
-            return nil
-        }
-
-        let trimmedVersion = rawVersion.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedVersion.isEmpty else {
-            return nil
-        }
-
-        let semverPattern = #"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$"#
-        return trimmedVersion.range(of: semverPattern, options: .regularExpression) != nil
-            ? trimmedVersion
-            : nil
-    }()
-
     func hostTelemetryPayload() -> [String: String] {
         var payload = [
             "surface": "mobile",
@@ -36,8 +19,8 @@ extension AdaWebHost {
             "webSdkOrigin": webSdk.rawValue,
         ]
 
-        if let frameworkSemver = Self.frameworkSemver {
-            payload["mobileVersion"] = frameworkSemver
+        if let packageVersion = AdaMessagingVersion.current {
+            payload["mobileVersion"] = packageVersion
         }
 
         return payload

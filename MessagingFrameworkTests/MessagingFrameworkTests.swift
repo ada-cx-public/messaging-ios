@@ -12,7 +12,7 @@ import Testing
 import UIKit
 import WebKit
 
-private let semverPattern = #"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$"#
+private let semverPattern = #"^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"#
 
 private func packageVersionFromSourceCheckout(filePath: String = #filePath) -> String? {
     let testsDirectory = URL(fileURLWithPath: filePath).deletingLastPathComponent()
@@ -27,6 +27,33 @@ private func packageVersionFromSourceCheckout(filePath: String = #filePath) -> S
     }
 
     return version
+}
+
+private func makeTemporaryBundle(version: String) throws -> (url: URL, bundle: Bundle) {
+    let bundleURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathExtension("bundle")
+    try FileManager.default.createDirectory(at: bundleURL, withIntermediateDirectories: true)
+
+    let info: [String: Any] = [
+        "CFBundleIdentifier": "cx.ada.messaging.tests.\(UUID().uuidString)",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleName": "AdaMessagingTestBundle",
+        "CFBundlePackageType": "BNDL",
+        "CFBundleShortVersionString": version,
+    ]
+    let data = try PropertyListSerialization.data(
+        fromPropertyList: info,
+        format: .xml,
+        options: 0,
+    )
+    try data.write(to: bundleURL.appendingPathComponent("Info.plist"))
+
+    guard let bundle = Bundle(url: bundleURL) else {
+        throw CocoaError(.fileReadInvalidFileName)
+    }
+
+    return (bundleURL, bundle)
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +257,7 @@ enum AdaWebHostDefaultsTests {
     }
 
     @Test
-    static func `host telemetry includes the framework semver version`() {
+    static func `host telemetry includes the package semver version`() {
         let host = AdaWebHost(handle: "ada-example")
         let payload = host.hostTelemetryPayload()
         let actualVersion = payload["mobileVersion"]
@@ -239,19 +266,77 @@ enum AdaWebHostDefaultsTests {
 
         #expect(payload["mobilePackage"] == "messaging-ios")
 
-        // `mobileVersion` is sourced from `CFBundleShortVersionString`, which is
-        // only populated when `AdaWebHost` is loaded from a framework bundle
-        // (xcodeproj build, xcframework, CocoaPods). SwiftPM-built test bundles
-        // resolve `Bundle(for:)` to a module whose Info.plist does not expose
-        // the framework's marketing version, so `actualVersion` is nil in that
-        // context and the regex/equality assertions are skipped. The framework
-        // path is covered by the xcodeproj test run in CI.
+        // Source-package checkouts intentionally keep a `0.0.0` placeholder.
+        // Release staging stamps AdaMessagingVersion.swift with the public
+        // package version; binary framework builds fall back to MARKETING_VERSION.
         if let actualVersion {
             #expect(actualVersion.range(of: semverPattern, options: .regularExpression) != nil)
-            if let expectedVersion {
+            if actualVersion != AdaMessagingVersion.placeholderVersion,
+               let expectedVersion {
                 #expect(actualVersion == expectedVersion)
             }
         }
+    }
+}
+
+enum AdaMessagingVersionTests {
+    @Test
+    static func `prefers a stamped package version over bundle versions`() throws {
+        let framework = try makeTemporaryBundle(version: "6.81.0")
+        let main = try makeTemporaryBundle(version: "7.0.0")
+        defer {
+            try? FileManager.default.removeItem(at: framework.url)
+            try? FileManager.default.removeItem(at: main.url)
+        }
+
+        let version = AdaMessagingVersion.resolve(
+            packageVersion: "1.1.0",
+            frameworkBundle: framework.bundle,
+            mainBundle: main.bundle,
+        )
+
+        #expect(version == "1.1.0")
+    }
+
+    @Test
+    static func `falls back to framework bundle version for binary builds`() throws {
+        let framework = try makeTemporaryBundle(version: "1.1.0")
+        let main = try makeTemporaryBundle(version: "6.81.0")
+        defer {
+            try? FileManager.default.removeItem(at: framework.url)
+            try? FileManager.default.removeItem(at: main.url)
+        }
+
+        let version = AdaMessagingVersion.resolve(
+            packageVersion: AdaMessagingVersion.placeholderVersion,
+            frameworkBundle: framework.bundle,
+            mainBundle: main.bundle,
+        )
+
+        #expect(version == "1.1.0")
+    }
+
+    @Test
+    static func `does not read the host app bundle version for source builds`() throws {
+        let hostApp = try makeTemporaryBundle(version: "6.81.0")
+        defer {
+            try? FileManager.default.removeItem(at: hostApp.url)
+        }
+
+        let version = AdaMessagingVersion.resolve(
+            packageVersion: AdaMessagingVersion.placeholderVersion,
+            frameworkBundle: hostApp.bundle,
+            mainBundle: hostApp.bundle,
+        )
+
+        #expect(version == AdaMessagingVersion.placeholderVersion)
+    }
+
+    @Test
+    static func `rejects malformed prerelease versions`() {
+        #expect(AdaMessagingVersion.normalizeSemver("1.2.3-rc.1") == "1.2.3-rc.1")
+        #expect(AdaMessagingVersion.normalizeSemver("1.2.3-rc..1") == nil)
+        #expect(AdaMessagingVersion.normalizeSemver("1.2.3-.rc") == nil)
     }
 }
 
