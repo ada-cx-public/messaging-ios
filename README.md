@@ -34,7 +34,7 @@ Xcode:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.1.1"),
+    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.2.0"),
 ],
 targets: [
     .target(
@@ -47,7 +47,7 @@ targets: [
 ### CocoaPods
 
 ```ruby
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.1.1"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.2.0"
 ```
 
 ### Carthage
@@ -138,7 +138,7 @@ import AdaMessaging
 pod "AdaEmbedFramework"
 
 # After
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.1.1"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.2.0"
 ```
 
 ## Important Code Changes To Make
@@ -190,7 +190,29 @@ adaWebHost.reset(
 ## Important Developer Notes
 
 - `openWebLinksInSafari` controls whether supported web links open in `SFSafariViewController`
-- `zdChatterAuthCallback` is supported for Zendesk chat authentication flows
+- `zdChatterAuthCallback` is supported for Zendesk Chat authentication flows on **both**
+  runtimes — the Legacy `adaEmbed.start` path and the Messaging bridge. Your callback is invoked
+  once per auth cycle, including the recurring refresh, and must call its completion handler
+  exactly once.
+- Leaving `zdChatterAuthCallback` unset behaves **differently per runtime**, so set it if your bot
+  uses authenticated Zendesk Chat. On **Messaging**, Ada resolves the handshake immediately rather
+  than burning its 10-second auth timeout, so the handoff proceeds unauthenticated instead of
+  stalling once per refresh cycle. On **Legacy** there is no such fast path: the injected
+  `adaEmbed.start` shim always installs the callback and posts to native, but native only answers
+  when your callback is set, so an unset callback leaves that handshake unanswered rather than
+  resolved
+- `enableProgrammaticControl` (default `false`) opens core's programmatic-control gate on the
+  Messaging runtime, which is otherwise closed and rejects programmatic requests. With it on you
+  can drive a send: `AdaBridgeHandler` is public with a public `init()`, and its
+  `sendCommand(_:to:)` takes the web view as a parameter, so you do not need the SDK's own
+  handler. Pass the `WKWebView` that `launchInjectingWebSupport(into:)` added to your view, with
+  an `Encodable` of shape `{"type": "ada.sendMessage", "payload": {"body": "…"}}`. Note this works
+  because those classes happen to be public, not because it is a designed host API — there is no
+  typed send on `AdaWebHost`, and composer-text set and the conversation/message reads have no
+  native command at all. **It also starts delivering message bodies to your app**: the gated
+  `ada:message:sent` / `ada:message:received` events carry the transcript and are forwarded to the
+  native bridge, so treat enabling this as a data-handling decision, not just an API unlock.
+  Ignored on the Legacy runtime, which has no such gate
 - `deviceToken` can be passed at initialization time or later with `setDeviceToken(deviceToken:)`
 - `webViewLoadingErrorCallback` lets you surface load failures or timeouts inside your app
 - if your bot flow allows camera, photo-library, or video capture uploads, add the corresponding iOS usage descriptions to your app's `Info.plist`, such as `NSCameraUsageDescription`, `NSPhotoLibraryUsageDescription`, and `NSMicrophoneUsageDescription`

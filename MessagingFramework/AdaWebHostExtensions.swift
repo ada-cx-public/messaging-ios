@@ -42,6 +42,7 @@ extension AdaWebHost {
 
         let userContentController = WKUserContentController()
         configuration.userContentController = userContentController
+        webviewUserContentController = userContentController
         registerMessageHandlers(on: userContentController)
 
         webView = WKWebView(frame: .zero, configuration: configuration)
@@ -78,6 +79,44 @@ extension AdaWebHost {
         }
     }
 
+    /// Neutralizes the current WebView before a rebuild. `setupWebView()` only
+    /// overwrites `webView`/`webviewUserContentController`, and a replaced
+    /// `WKWebView` is NOT inert: detached, it keeps loading and executing JS
+    /// (the load-timeout Task retains it for the full `webViewTimeout`), so its
+    /// document would spend the single-use `identityToken` (401
+    /// `identity_token_already_used` for the document the customer actually
+    /// uses), fire a premature `sdk.ready` through the shared `bridgeHandler` —
+    /// disarming the NEW WebView's still-unconsumed config script and flushing
+    /// queued commands before the new bridge exists — and keep emitting
+    /// duplicate SDK events to customer callbacks. Every rebuild must tear the
+    /// predecessor down first.
+    func teardownWebView() {
+        if let controller = webviewUserContentController {
+            // Cuts the orphan document's message path into the shared
+            // bridgeHandler (and, on the legacy page, into self), and strips
+            // the armed config script so no orphan document can spend the
+            // identity token.
+            controller.removeAllScriptMessageHandlers()
+            controller.removeAllUserScripts()
+        }
+        webviewConfigUserScript = nil
+        webviewUserContentController = nil
+
+        if let replacedWebView = webView {
+            // Also keeps the load-timeout Task's late `isLoading` check from
+            // reporting a false timeout for a WebView that no longer matters.
+            replacedWebView.stopLoading()
+            replacedWebView.navigationDelegate = nil
+            replacedWebView.uiDelegate = nil
+            replacedWebView.removeFromSuperview()
+        }
+        webView = nil
+
+        // Whatever readiness the replaced runtime reported died with it —
+        // queue commands until the rebuilt runtime reports its own sdk.ready.
+        webHostLoaded = false
+    }
+
     private static func sleepForWebViewTimeout(_ timeout: TimeInterval) async throws {
         if #available(iOS 16.0, *) {
             try await Task.sleep(for: .seconds(timeout))
@@ -92,10 +131,19 @@ extension AdaWebHost {
 
     private func registerMessageHandlers(on userContentController: WKUserContentController) {
         if usesBridgeRuntime {
+            // Same trusted origin the config script is scoped to: the host page
+            // the WebView loads. Fails closed — with no resolvable origin the
+            // handler drops every message.
+            bridgeHandler.trustedOrigin = environment.flatMap { Self.pageOrigin(ofUrl: $0.webviewHtmlUrl) }
             userContentController.add(bridgeHandler, name: "adaBridge")
 
             if let initialStateScript = bridgeHandler.makeInitialStateScript() {
                 userContentController.addUserScript(initialStateScript)
+            }
+
+            if let webviewConfigScript = makeWebviewConfigScript() {
+                userContentController.addUserScript(webviewConfigScript)
+                webviewConfigUserScript = webviewConfigScript
             }
         }
 
@@ -163,22 +211,25 @@ extension AdaWebHost {
         }
     }
 
-    private func errorInterceptorScript() -> WKUserScript {
-        let source = """
+    private static let errorInterceptorScriptSource = """
         (function() {
-            function reportBridgeError(message) {
+            function postToBridge(message) {
                 try {
                     var handler =
                         window.webkit &&
                         window.webkit.messageHandlers &&
                         window.webkit.messageHandlers.adaBridge;
                     if (handler) {
-                        handler.postMessage({
-                            type: "sdk.error",
-                            error: message
-                        });
+                        handler.postMessage(message);
                     }
                 } catch (_) {}
+            }
+
+            function reportBridgeError(message) {
+                postToBridge({
+                    type: "sdk.error",
+                    error: message
+                });
             }
 
             var originalOnError = window.onerror;
@@ -198,14 +249,185 @@ extension AdaWebHost {
                     String(event && event.reason ? event.reason : "unknown")
                 );
             });
-        })();
-        """
 
+            // Resource load failures do not bubble, so only a capture-phase
+            // listener sees them. Runtime script errors reach window.onerror
+            // above instead (their target is the window, filtered out here).
+            // De-duplicated per URL: retry loops for one broken asset must not
+            // flood the bridge.
+            var reportedSubresourceUrls = {};
+            window.addEventListener("error", function(event) {
+                var target = event && event.target;
+                if (!target || target === window || !target.tagName) {
+                    return;
+                }
+                var url = target.currentSrc || target.src || target.href || "";
+                if (typeof url !== "string" || url === "" ||
+                    reportedSubresourceUrls[url] === true) {
+                    return;
+                }
+                reportedSubresourceUrls[url] = true;
+                postToBridge({
+                    type: "sdk.subresourceLoadFailed",
+                    url: url,
+                    element: String(target.tagName).toLowerCase()
+                });
+            }, true);
+        })();
+    """
+
+    func errorInterceptorScript() -> WKUserScript {
+        WKUserScript(
+            source: Self.errorInterceptorScriptSource,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true,
+        )
+    }
+
+    /// sessionStorage key the webview runtime writes (with the consumed token's
+    /// `injectionId`) after it reads an injected `identityToken`. Pinned to
+    /// `IDENTITY_TOKEN_CONSUMED_STORAGE_KEY` in
+    /// `packages/sdk/src/mobile-webview-runtime.ts` — the two literals must match.
+    static let identityTokenConsumedStorageKey = "__ada_identity_token_consumed__"
+
+    /// Non-sensitive per-token id paired with an injected `identityToken`
+    /// (FNV-1a 32-bit over UTF-16 code units, hex). The runtime stores it in
+    /// sessionStorage on consumption; the emitted guard compares against it so a
+    /// spent token is withheld from later documents while a NEW token (new id) is
+    /// still delivered. Only distinguishes tokens from each other — not a security
+    /// primitive, reveals nothing about the token.
+    static func identityTokenInjectionId(_ identityToken: String) -> String {
+        var hash: UInt32 = 2_166_136_261
+        for codeUnit in identityToken.utf16 {
+            hash ^= UInt32(codeUnit)
+            hash = hash &* 16_777_619
+        }
+        return String(hash, radix: 16)
+    }
+
+    private func jsonObjectString(_ object: [String: String]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: object),
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        return json
+    }
+
+    /// Returns a `WKUserScript` that sets the one-shot `window.__ADA_WEBVIEW_CONFIG__`
+    /// global before the document starts loading. The webview runtime reads it once
+    /// inside `mountAdaWebViewRuntime`, merges it into the start config, and deletes
+    /// it. Sensitive values (`identityToken`) travel through this global — never the
+    /// URL — so they stay out of request logs. The payload is JSON-serialized, never
+    /// string-interpolated, so values cannot break out of the script.
+    ///
+    /// A `WKUserScript` has no origin scoping: it re-executes on EVERY main-frame
+    /// document for the webview's lifetime, and non-link-activated top-level
+    /// navigations (redirects, meta refresh, script-driven location changes) are
+    /// allowed by the navigation delegate. The `location.origin` guard makes the
+    /// script a no-op on any document that is not the Ada webview host page, so the
+    /// identity token is never handed to a third-party origin (mirrors Android's
+    /// `trustedBridgeOriginRules` scoping). When no trusted origin can be resolved,
+    /// no script is built — the token is never injected unguarded.
+    ///
+    /// The identity token is additionally one-shot PER TOKEN, not per document: the
+    /// runtime records the token's `injectionId` in sessionStorage when it consumes
+    /// it, and the emitted guard withholds the (spent, single-use) token from every
+    /// later document in the same webview session — replaying it would force the
+    /// runtime through the failed-exchange storage wipe. `appUrl` is plain config
+    /// and keeps riding every document so a reload re-mounts the custom app. The
+    /// registration is removed outright in `disarmWebviewConfigScript()` once the
+    /// runtime reports ready. When sessionStorage is unavailable the script
+    /// degrades to delivering the token rather than breaking identity entirely.
+    ///
+    /// Returns `nil` on the Legacy runtime or when there is nothing to send.
+    func makeWebviewConfigScript() -> WKUserScript? {
+        guard webSdk == .messaging, let environment else { return nil }
+
+        var trimmedIdentityToken = identityToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedIdentityToken.isEmpty, trimmedIdentityToken == consumedIdentityToken {
+            // A rebuilt WebView has fresh sessionStorage, so the in-script
+            // consumed-marker guard cannot withhold the spent token — only this
+            // native memo can (mirrors Android's TokenAlreadyConsumed decision).
+            debugPrint(
+                "[AdaWebHost] identityToken was already consumed by the runtime and is "
+                    + "not re-injected. Mint a new token to re-authenticate.",
+            )
+            trimmedIdentityToken = ""
+        }
+        var retainedConfig: [String: String] = [:]
+        let trimmedAppUrl = appUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedAppUrl.isEmpty {
+            retainedConfig["appUrl"] = trimmedAppUrl
+        }
+
+        guard !trimmedIdentityToken.isEmpty || !retainedConfig.isEmpty,
+              let trustedOrigin = Self.pageOrigin(ofUrl: environment.webviewHtmlUrl),
+              let retainedJson = jsonObjectString(retainedConfig)
+        else { return nil }
+
+        let originJson = jsonStr(trustedOrigin)
+
+        if trimmedIdentityToken.isEmpty {
+            return WKUserScript(
+                source: "if (window.location.origin === \(originJson)) { "
+                    + "window.__ADA_WEBVIEW_CONFIG__ = \(retainedJson); }",
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true,
+            )
+        }
+
+        let injectionId = Self.identityTokenInjectionId(trimmedIdentityToken)
+        var fullConfig = retainedConfig
+        fullConfig["identityToken"] = trimmedIdentityToken
+        fullConfig["injectionId"] = injectionId
+        guard let fullJson = jsonObjectString(fullConfig) else { return nil }
+
+        let markerKeyJson = jsonStr(Self.identityTokenConsumedStorageKey)
+        let injectionIdJson = jsonStr(injectionId)
+        let source = "if (window.location.origin === \(originJson)) { "
+            + "window.__ADA_WEBVIEW_CONFIG__ = (function () { "
+            + "try { if (window.sessionStorage.getItem(\(markerKeyJson)) === \(injectionIdJson)) "
+            + "{ return \(retainedJson); } } catch (e) {} "
+            + "return \(fullJson); "
+            + "})(); }"
         return WKUserScript(
             source: source,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true,
         )
+    }
+
+    /// Removes the armed `window.__ADA_WEBVIEW_CONFIG__` document-start script once
+    /// the runtime reports ready: the mount has consumed (or the in-script guard
+    /// withheld) the one-shot token, and no later document in this webview may
+    /// receive it again. `WKUserContentController` has no single-script removal,
+    /// so the list is rebuilt without exactly the armed script.
+    func disarmWebviewConfigScript() {
+        guard let armedScript = webviewConfigUserScript,
+              let controller = webviewUserContentController
+        else { return }
+        webviewConfigUserScript = nil
+        let remainingScripts = controller.userScripts.filter { $0 !== armedScript }
+        controller.removeAllUserScripts()
+        remainingScripts.forEach(controller.addUserScript)
+    }
+
+    /// Derives the value `window.location.origin` reports for a document loaded from
+    /// `urlString`: lowercased scheme and host, with the port only when it is not the
+    /// scheme's default — a default port in the URL would otherwise never match.
+    /// Only http(s) URLs carry a guardable origin; anything else returns `nil` so the
+    /// caller fails closed (mirrors React Native's `scriptGuardOrigin`).
+    nonisolated static func pageOrigin(ofUrl urlString: String) -> String? {
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = url.host?.lowercased(),
+              !host.isEmpty
+        else { return nil }
+
+        let defaultPorts: [String: Int] = ["https": 443, "http": 80]
+        if let port = url.port, port != defaultPorts[scheme] {
+            return "\(scheme)://\(host):\(port)"
+        }
+        return "\(scheme)://\(host)"
     }
 
     func buildWebviewRequest(url: URL, environment: AdaEnvironment) -> URLRequest {
@@ -243,6 +465,17 @@ extension AdaWebHost {
             queryItems.append(URLQueryItem(name: "ada_cluster", value: edgeCluster))
         }
         queryItems.append(URLQueryItem(name: "ada_web_sdk", value: webSdk.rawValue))
+        // Only the Messaging runtime reads it, and only an opted-in host sends it — the
+        // param's absence is what keeps the gate closed for existing integrations.
+        if enableProgrammaticControl, webSdk == .messaging {
+            queryItems.append(URLQueryItem(name: "enableProgrammaticControl", value: "true"))
+        }
+        if headless, webSdk == .messaging {
+            queryItems.append(URLQueryItem(name: "headless", value: "true"))
+        }
+        queryItems.append(
+            contentsOf: [expectsIdentityTokenQueryItem(), messagingStylesQueryItem()].compactMap(\.self),
+        )
         if !language.isEmpty {
             queryItems.append(URLQueryItem(name: "language", value: language))
         }
@@ -261,6 +494,51 @@ extension AdaWebHost {
 
         components.queryItems = queryItems
         return components.url
+    }
+
+    /// Boolean only — the token itself never rides the URL. Lets the runtime
+    /// report (instead of silently starting anonymous) when the armed
+    /// identityToken injection never delivered. A consumed token is no longer
+    /// armed, so flagging it would make the runtime report a false loss.
+    private func expectsIdentityTokenQueryItem() -> URLQueryItem? {
+        let trimmedIdentityToken = identityToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard webSdk == .messaging,
+              !trimmedIdentityToken.isEmpty,
+              trimmedIdentityToken != consumedIdentityToken
+        else { return nil }
+        return URLQueryItem(name: "expectsIdentityToken", value: "true")
+    }
+
+    /// Messaging styles are a JSON object of string tokens riding the shared
+    /// `styles` query param; the legacy CSS-string shape has no meaning to the
+    /// Messaging runtime and is dropped rather than sent malformed.
+    private func messagingStylesQueryItem() -> URLQueryItem? {
+        guard webSdk == .messaging else { return nil }
+        let trimmedStyles = styles.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedStyles.isEmpty else { return nil }
+        guard let stylesJson = Self.messagingStylesJson(trimmedStyles) else {
+            debugPrint(
+                "[AdaWebHost] styles must be a JSON object of string values on the "
+                    + "Messaging runtime — ignoring.",
+            )
+            return nil
+        }
+        return URLQueryItem(name: "styles", value: stylesJson)
+    }
+
+    /// Validates and canonicalizes the Messaging `styles` value: it must parse
+    /// as a JSON object whose values are all strings (the runtime's
+    /// `Record<string, string>` contract). Returns the re-serialized JSON, or
+    /// `nil` for any other shape — including the Legacy runtime's CSS-string
+    /// form, which the Messaging runtime cannot interpret.
+    static func messagingStylesJson(_ styles: String) -> String? {
+        guard let data = styles.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: String],
+              !object.isEmpty,
+              let normalized = try? JSONSerialization.data(withJSONObject: object),
+              let json = String(data: normalized, encoding: .utf8)
+        else { return nil }
+        return json
     }
 
     private func legacyMobileSdkWebviewUrl() -> URL? {

@@ -117,7 +117,7 @@ public extension AdaWebHost {
                     greeting: greeting,
                     metaFields: metaFields,
                     sensitiveMetaFields: sensitiveMetaFields,
-                    resetChatHistory: resetChatHistory ?? true,
+                    resetChatHistory: resetChatHistory,
                     to: webView,
                 )
             }
@@ -148,7 +148,7 @@ public extension AdaWebHost {
                     greeting: greeting,
                     metaFields: metaFields.build().metaFields,
                     sensitiveMetaFields: nil,
-                    resetChatHistory: resetChatHistory ?? true,
+                    resetChatHistory: resetChatHistory,
                     to: webView,
                 )
             }
@@ -179,7 +179,7 @@ public extension AdaWebHost {
                     greeting: greeting,
                     metaFields: nil,
                     sensitiveMetaFields: sensitiveMetaFields.build().metaFields,
-                    resetChatHistory: resetChatHistory ?? true,
+                    resetChatHistory: resetChatHistory,
                     to: webView,
                 )
             }
@@ -211,7 +211,7 @@ public extension AdaWebHost {
                     greeting: greeting,
                     metaFields: metaFields.build().metaFields,
                     sensitiveMetaFields: sensitiveMetaFields.build().metaFields,
-                    resetChatHistory: resetChatHistory ?? true,
+                    resetChatHistory: resetChatHistory,
                     to: webView,
                 )
             }
@@ -235,7 +235,7 @@ public extension AdaWebHost {
                 bridgeHandler.reset(
                     language: language,
                     greeting: greeting,
-                    resetChatHistory: resetChatHistory ?? true,
+                    resetChatHistory: resetChatHistory,
                     to: webView,
                 )
             }
@@ -262,6 +262,32 @@ public extension AdaWebHost {
             return
         }
         evalJS("adaEmbed.deleteHistory();")
+    }
+
+    /// Programmatically send a user message into the conversation.
+    ///
+    /// Messaging runtime only, and core rejects it with `ProgrammaticControlNotEnabled`
+    /// unless the host was created with `enableProgrammaticControl: true`. Queued until
+    /// the runtime is ready. The legacy remote host page has no send command, so the
+    /// call is dropped there.
+    func sendMessage(_ body: String) {
+        guard usesBridgeRuntime else {
+            debugPrint("[AdaWebHost] sendMessage is not supported on the legacy remote host page")
+            return
+        }
+        dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+            bridgeHandler.sendMessage(body, to: webView)
+        }
+    }
+
+    /// Removes the natively persisted state cache (allowlisted, non-sensitive
+    /// startup/branding state in `UserDefaults`) — call on user sign-out or
+    /// whenever recoverable chat state should be discarded. The next WebView
+    /// session starts without rehydrated state. Does not touch the web
+    /// runtime's own storage; use ``deleteHistory()`` or `reset` for the
+    /// conversation itself.
+    func clearPersistedState() {
+        bridgeHandler.clearPersistedState()
     }
 
     func setLanguage(language: String) {

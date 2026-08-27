@@ -15,8 +15,12 @@
 //     JSON-encoded by the native side before dispatch.
 //
 //  Security notes:
-//   • The persisted state cache may contain session credentials and other
-//     sensitive session fields needed for fast rehydration. Clear it on sign-out
+//   • WKWebView exposes `window.webkit.messageHandlers` to every frame, so
+//     incoming messages are accepted only from the main frame whose security
+//     origin equals `trustedOrigin` — a custom-app `appUrl` iframe cannot forge
+//     `sdk.event` / `sdk.ready` or poison the persisted state cache.
+//   • The persisted state cache is filtered to `persistableStateKeys` before it is
+//     written, so it holds startup/branding config and no credentials. Clear it on sign-out
 //     or when your app should discard recoverable chat state.
 //   • evaluateJavaScript is called with a fixed template; the JSON payload is
 //     a single argument passed through the window.__ADA_BRIDGE_DISPATCH__ function
@@ -42,6 +46,18 @@ import WebKit
 
     /// Called when the bridge adapter reports a fatal error.
     @objc optional func adaBridge(_ bridge: AdaBridgeHandler, didEncounterError error: String)
+
+    /// Called when the runtime page reports that one of its subresources
+    /// (script, stylesheet, image, frame) failed to load. `details` carries the
+    /// failed `url` and the loading `element` tag name. The main-frame load is
+    /// unaffected — navigation failures arrive through `WKNavigationDelegate`.
+    @objc optional func adaBridge(_ bridge: AdaBridgeHandler, didFailSubresourceLoad details: [String: Any])
+
+    /// Called when the Messaging runtime asks the native host for a Zendesk Chat chatter-auth
+    /// token. The host must answer with `sendZendeskChatterAuthResponse(token:to:)` exactly
+    /// once — core's wait is bounded at 10s, and a host that never answers burns that 10s timeout
+    /// on every refresh cycle for the whole handoff rather than failing fast.
+    @objc optional func adaBridgeDidRequestZendeskChatterAuth(_ bridge: AdaBridgeHandler)
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +74,9 @@ import WebKit
 /// ```swift
 /// let handler = AdaBridgeHandler()
 /// handler.delegate = self
+/// // Origin of the page you load below — messages from any other origin
+/// // (or from a subframe) are dropped.
+/// handler.trustedOrigin = "https://example.ada.support"
 ///
 /// let config = WKWebViewConfiguration()
 /// config.userContentController.add(handler, name: "adaBridge")
@@ -76,6 +95,16 @@ import WebKit
 
     /// Delegate that receives event and lifecycle callbacks.
     public weak var delegate: AdaBridgeDelegate?
+
+    /// Origin of the host page the WebView is configured to load, in
+    /// `scheme://host[:port]` form with the port omitted when it is the scheme
+    /// default (`AdaWebHost.pageOrigin(ofUrl:)` produces this shape). WKWebView
+    /// exposes `window.webkit.messageHandlers` to every frame — including a
+    /// custom-app `appUrl` iframe — so an incoming message is dropped unless it
+    /// arrives from the main frame with exactly this origin. `nil` fails closed:
+    /// every message is dropped (mirrors Android's `trustedBridgeOriginRules`
+    /// scoping and `isMainFrame` gate on `addWebMessageListener`).
+    public var trustedOrigin: String?
 
     // -----------------------------------------------------------------------
     // Private
@@ -112,9 +141,77 @@ import WebKit
 
     // -----------------------------------------------------------------------
 
-    /// Returns a copy of `state` suitable for persistence.
+    /// The only keys written to `UserDefaults`.
+    ///
+    /// An allowlist, not a denylist: a denylist re-opens the hole the first time a new
+    /// sensitive key appears upstream, whereas an unrecognized key here is simply not
+    /// persisted. Mirrors `PERSISTABLE_NATIVE_STATE_KEYS` in
+    /// `packages/sdk/src/frame-channel/types.ts`, which is the canonical list — a drift
+    /// test reads this declaration and fails if the two disagree.
+    ///
+    /// `__ada_cached_at__` is load-bearing: it bounds the hydration snapshot to a 10-minute
+    /// TTL on the web side. Dropping it does not disable rehydration — the bridge accepts an
+    /// undated snapshot — it removes that bound. This class keeps its own `cachedAtKey`
+    /// timestamp, so native still discards a stale snapshot before injecting it.
+    nonisolated static let persistableStateKeys: Set<String> = [
+        "advancedColorsEnabled",
+        "allowedProtocols",
+        "button",
+        "chatEnabled",
+        "fallbackUi",
+        "features",
+        "intro",
+        "proactiveConversations",
+        "textOverAccentColor",
+        "tintColor",
+        "__ada_cached_at__",
+    ]
+
+    /// Returns a copy of `state` suitable for persistence, dropping every key outside
+    /// `persistableStateKeys`.
     nonisolated static func stateForPersistence(_ state: [String: Any]) -> [String: Any] {
-        state
+        state.filter { persistableStateKeys.contains($0.key) }
+    }
+
+    /// Filters a `sdk.subresourceLoadFailed` bridge message down to its
+    /// string-typed fields — a page script could post arbitrary shapes at the
+    /// handler.
+    nonisolated static func subresourceLoadDetails(from body: [String: Any]) -> [String: Any] {
+        var details: [String: Any] = [:]
+        if let url = body["url"] as? String {
+            details["url"] = url
+        }
+        if let element = body["element"] as? String {
+            details["element"] = element
+        }
+        return details
+    }
+
+    /// Trust decision for an incoming bridge message: main frame only, and the
+    /// sender's security origin must equal `trustedOrigin` exactly — a
+    /// suffix-lookalike host is foreign. Only http(s) origins are comparable.
+    /// `WKSecurityOrigin` reports a scheme-default port as 0, and an explicit
+    /// default port normalizes to the omitted form, so `https://host:443` and
+    /// `https://host` agree.
+    nonisolated static func isTrustedBridgeMessage(
+        frameIsMain: Bool,
+        originProtocol: String,
+        originHost: String,
+        originPort: Int,
+        trustedOrigin: String?,
+    ) -> Bool {
+        guard frameIsMain, let trustedOrigin else { return false }
+        // Delegate normalization to pageOrigin — the same function that
+        // produced trustedOrigin — so the two sides cannot drift.
+        // WKSecurityOrigin.host reports IPv6 unbracketed, but URL(string:)
+        // rejects an unbracketed IPv6 authority, so re-bracket before parsing;
+        // pageOrigin then lowercases and strips default ports on both sides.
+        let bareHost = originHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        let urlHost = bareHost.contains(":") ? "[\(bareHost)]" : bareHost
+        let raw = originPort > 0
+            ? "\(originProtocol)://\(urlHost):\(originPort)"
+            : "\(originProtocol)://\(urlHost)"
+        return AdaWebHost.pageOrigin(ofUrl: raw) == trustedOrigin
     }
 
     /// Escapes a JSON string so it is safe to pass as a JS template-literal argument.
@@ -140,9 +237,50 @@ import WebKit
         didReceive message: WKScriptMessage,
     ) {
         guard message.name == "adaBridge",
-              let body = message.body as? [String: Any],
-              let type = body["type"] as? String
+              isTrustedSource(of: message),
+              let body = message.body as? [String: Any]
         else { return }
+
+        handleBridgeMessage(body)
+    }
+
+    /// Whether `message` was posted by the main frame of the trusted host page.
+    /// Instance-level so tests can substitute it — `WKFrameInfo` and
+    /// `WKSecurityOrigin` cannot be fabricated off-device; the decision itself
+    /// lives in `isTrustedBridgeMessage`.
+    func isTrustedSource(of message: WKScriptMessage) -> Bool {
+        let frameInfo = message.frameInfo
+        let origin = frameInfo.securityOrigin
+        let trusted = Self.isTrustedBridgeMessage(
+            frameIsMain: frameInfo.isMainFrame,
+            originProtocol: origin.protocol,
+            originHost: origin.host,
+            originPort: origin.port,
+            trustedOrigin: trustedOrigin,
+        )
+        if !trusted {
+            // Fail-closed with a diagnostic (Android parity: it logs both a
+            // missing trusted origin and a rejected sender). A silent drop
+            // presents as "chat never becomes ready" with no evidence.
+            if trustedOrigin == nil {
+                debugPrint(
+                    "AdaBridgeHandler: bridge messaging disabled — no trustedOrigin is set; dropping \(message.name) message",
+                )
+            } else {
+                let sender = "\(origin.protocol)://\(origin.host):\(origin.port)"
+                debugPrint(
+                    "AdaBridgeHandler: rejected bridge message from untrusted source \(sender) (mainFrame: \(frameInfo.isMainFrame))",
+                )
+            }
+        }
+        return trusted
+    }
+
+    /// Routes a source-validated bridge message body. Split from
+    /// `userContentController(_:didReceive:)` so unit tests can drive routing
+    /// without fabricating `WKScriptMessage.frameInfo`.
+    func handleBridgeMessage(_ body: [String: Any]) {
+        guard let type = body["type"] as? String else { return }
 
         switch type {
         case "sdk.event":
@@ -157,9 +295,15 @@ import WebKit
                 persistState(state)
             }
 
+        case "sdk.zdChatterAuthRequest":
+            delegate?.adaBridgeDidRequestZendeskChatterAuth?(self)
+
         case "sdk.error":
             let error = body["error"] as? String ?? "Unknown bridge error"
             delegate?.adaBridge?(self, didEncounterError: error)
+
+        case "sdk.subresourceLoadFailed":
+            delegate?.adaBridge?(self, didFailSubresourceLoad: Self.subresourceLoadDetails(from: body))
 
         default:
             break
@@ -237,6 +381,20 @@ import WebKit
 
     // -----------------------------------------------------------------------
 
+    /// Answer a `sdk.zdChatterAuthRequest` with the host's Zendesk Chat chatter-auth token.
+    ///
+    /// Pass `nil` when the host has no token configured: core resolves immediately instead of
+    /// waiting out the SDK's 10s auth timeout, which it would otherwise do on every cycle.
+    public func sendZendeskChatterAuthResponse(token: String?, to webView: WKWebView) {
+        dispatchCommand(
+            [
+                "type": "ada.zdChatterAuthResponse",
+                "payload": ["token": token.map { $0 as Any } ?? NSNull()],
+            ],
+            to: webView,
+        )
+    }
+
     /// Update meta-fields without resetting the session.
     public func setMetaFields(_ fields: [String: Any], to webView: WKWebView) {
         dispatchCommand(
@@ -269,18 +427,31 @@ import WebKit
         dispatchCommand(["type": "ada.setLanguage", "payload": ["language": language]], to: webView)
     }
 
+    /// Programmatically send a user message into the conversation.
+    public func sendMessage(_ body: String, to webView: WKWebView) {
+        dispatchCommand(["type": "ada.sendMessage", "payload": ["body": body]], to: webView)
+    }
+
     /// Delete chat history and reset the session.
     public func deleteHistory(to webView: WKWebView) {
         dispatchCommand(["type": "ada.deleteHistory"], to: webView)
     }
 
     /// Reset the Ada session with optional language, greeting, meta-fields, and history flags.
+    ///
+    /// `resetChatHistory` is tri-state: `true` and `false` are sent explicitly —
+    /// an omitted `false` would let the SDK's missing-key default silently destroy
+    /// the conversation and mint a new end user instead of taking the
+    /// history-preserving path. `nil` omits the key so the runtime applies its own
+    /// default (currently a full reset), matching Android and React Native. The
+    /// parameter default stays `true` so a plain `reset` keeps requesting the full
+    /// reset explicitly rather than depending on that runtime default.
     public func reset(
         language: String? = nil,
         greeting: String? = nil,
         metaFields: [String: Any]? = nil,
         sensitiveMetaFields: [String: Any]? = nil,
-        resetChatHistory: Bool = false,
+        resetChatHistory: Bool? = true,
         to webView: WKWebView,
     ) {
         var payload: [String: Any] = [:]
@@ -288,7 +459,7 @@ import WebKit
         if let greeting { payload["greeting"] = greeting }
         if let metaFields { payload["metaFields"] = metaFields }
         if let sensitiveMetaFields { payload["sensitiveMetaFields"] = sensitiveMetaFields }
-        if resetChatHistory { payload["resetChatHistory"] = true }
+        if let resetChatHistory { payload["resetChatHistory"] = resetChatHistory }
         dispatchCommand(["type": "ada.reset", "payload": payload], to: webView)
     }
 

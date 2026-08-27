@@ -24,6 +24,8 @@ extension AdaWebHost: WKScriptMessageHandler {
         } else if messageName == "eventCallbackHandler",
                   let event = message.body as? [String: Any]
         {
+            dispatchEventToSubscribers(event, rawData: rawSdkEventData(event))
+
             if let eventName = event["event_name"] as? String,
                let specificCallback = eventCallbacks?[eventName]
             {
@@ -34,6 +36,99 @@ extension AdaWebHost: WKScriptMessageHandler {
                 wildcardCallback(event)
             }
         }
+    }
+}
+
+// MARK: - Multi-subscriber event callbacks
+
+public extension AdaWebHost {
+    /// Registers `callback` for events named `eventName`; `"*"` (the default)
+    /// receives every event. Unlike ``eventCallbacks`` — one closure per key,
+    /// replaced wholesale — any number of callbacks can subscribe to the same
+    /// event. Mirrors Android's `addEventCallback`.
+    @discardableResult
+    func addEventCallback(
+        _ eventName: String = "*",
+        callback: @escaping (_ event: [String: Any]) -> Void,
+    ) -> AdaEventSubscription {
+        let subscription = AdaEventSubscription()
+        eventCallbackSubscriptions[eventName, default: []]
+            .append((token: ObjectIdentifier(subscription), callback: callback))
+        return subscription
+    }
+
+    /// Removes exactly the callback that ``addEventCallback(_:callback:)``
+    /// returned `subscription` for. Unknown tokens are a no-op. Mirrors
+    /// Android's `removeEventCallback`.
+    func removeEventCallback(_ subscription: AdaEventSubscription) {
+        let token = ObjectIdentifier(subscription)
+        for (eventName, entries) in eventCallbackSubscriptions {
+            let remaining = entries.filter { $0.token != token }
+            if remaining.count != entries.count {
+                eventCallbackSubscriptions[eventName] = remaining.isEmpty ? nil : remaining
+            }
+        }
+    }
+
+    /// Removes every callback registered through ``addEventCallback(_:callback:)``
+    /// for `eventName` (`"*"` by default). Mirrors Android's `removeEventCallbacks`.
+    func removeEventCallbacks(_ eventName: String = "*") {
+        eventCallbackSubscriptions[eventName] = nil
+    }
+
+    /// Registers a raw sink that receives every SDK event as its key plus its
+    /// JSON-encoded data, without knowing keys in advance. Mirrors Android's
+    /// `addSdkEventCallback`.
+    @discardableResult
+    func addSdkEventCallback(
+        _ callback: @escaping (_ key: String, _ data: String?) -> Void,
+    ) -> AdaEventSubscription {
+        let subscription = AdaEventSubscription()
+        sdkEventCallbackSubscriptions.append((token: ObjectIdentifier(subscription), callback: callback))
+        return subscription
+    }
+
+    /// Removes exactly the raw sink that ``addSdkEventCallback(_:)`` returned
+    /// `subscription` for. Mirrors Android's `removeSdkEventCallback`.
+    func removeSdkEventCallback(_ subscription: AdaEventSubscription) {
+        let token = ObjectIdentifier(subscription)
+        sdkEventCallbackSubscriptions.removeAll { $0.token == token }
+    }
+}
+
+extension AdaWebHost {
+    /// Fans one event out to the multi-subscriber registries: raw sinks first,
+    /// then the callbacks keyed by the event's name, then the `"*"` catch-all
+    /// (Android's dispatch order). The single-closure ``eventCallbacks``
+    /// dictionary is NOT dispatched here — each emission site keeps its exact
+    /// historical delivery for that surface.
+    func dispatchEventToSubscribers(_ event: [String: Any], rawData: String?) {
+        let name = event["event_name"] as? String ?? ""
+        for entry in sdkEventCallbackSubscriptions {
+            entry.callback(name, rawData)
+        }
+        for entry in eventCallbackSubscriptions[name] ?? [] {
+            entry.callback(event)
+        }
+        if name != "*" {
+            for entry in eventCallbackSubscriptions["*"] ?? [] {
+                entry.callback(event)
+            }
+        }
+    }
+
+    /// JSON-encodes an event payload for the raw ``addSdkEventCallback(_:)``
+    /// sinks. Strings pass through unquoted, matching Android's `optString`
+    /// treatment of the bridge's `data` field.
+    func rawSdkEventData(_ value: Any?) -> String? {
+        guard let value else { return nil }
+        if let string = value as? String { return string }
+        guard JSONSerialization.isValidJSONObject(value)
+            || value is NSNumber || value is NSNull,
+            let data = try? JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed),
+            let json = String(data: data, encoding: .utf8)
+        else { return nil }
+        return json
     }
 }
 
@@ -170,9 +265,19 @@ extension AdaWebHost {
 extension AdaWebHost: AdaBridgeDelegate {
     /// Called when the Ada SDK signals it is ready to accept commands (new bridge path).
     public func adaBridgeDidBecomeReady(_: AdaBridgeHandler) {
+        // The mount consumed the one-shot identityToken (or the in-script guard
+        // withheld it); memo the spent token so a WebView rebuild never re-arms
+        // it, then remove the document-start registration so no later document
+        // can replay the spent credential.
+        let trimmedIdentityToken = identityToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedIdentityToken.isEmpty, webviewConfigUserScript != nil {
+            consumedIdentityToken = trimmedIdentityToken
+        }
+        disarmWebviewConfigScript()
         webHostLoaded = true
+        let event: [String: Any] = ["event_name": "sdk.ready", "web_sdk": webSdk.rawValue]
+        dispatchEventToSubscribers(event, rawData: rawSdkEventData(event))
         if let callbacks = eventCallbacks {
-            let event: [String: Any] = ["event_name": "sdk.ready", "web_sdk": webSdk.rawValue]
             callbacks["sdk.ready"]?(event)
             callbacks["*"]?(event)
         }
@@ -180,13 +285,54 @@ extension AdaWebHost: AdaBridgeDelegate {
         if !deviceToken.isEmpty, let webView {
             bridgeHandler.setDeviceToken(deviceToken, to: webView)
         }
+        // Init-time sensitive meta-fields must travel through the bridge — only the legacy
+        // `adaEmbed.start(...)` payload carried them before, so the Messaging runtime
+        // silently dropped them. Never sent via the URL. Mirrors Android's
+        // `enqueueInitialBridgeState`.
+        if !sensitiveMetafields.isEmpty, let webView {
+            bridgeHandler.setSensitiveMetaFields(sensitiveMetafields, to: webView)
+        }
+    }
+
+    /// Answer the Messaging runtime's Zendesk Chat chatter-auth handshake.
+    ///
+    /// The public `zdChatterAuthCallback` was previously wired only into the legacy
+    /// `adaEmbed.start(...)` payload, so on the Messaging runtime the request was posted and
+    /// dropped: core waited out the SDK's own 10s auth timeout, PATCHed without a token,
+    /// then rescheduled itself at `expireIn` and repeated for the whole handoff. Reuses the
+    /// same public property, so customer code needs no change.
+    public func adaBridgeDidRequestZendeskChatterAuth(_ handler: AdaBridgeHandler) {
+        guard let webView else { return }
+        guard let zdChatterAuthCallback else {
+            // Resolve immediately rather than burning the SDK's 10s auth timeout on a host
+            // that has no token to give — the same guard the React Native handler applies.
+            handler.sendZendeskChatterAuthResponse(token: nil, to: webView)
+            return
+        }
+        zdChatterAuthRequestSeq &+= 1
+        let requestSeq = zdChatterAuthRequestSeq
+        var hasResponded = false
+        zdChatterAuthCallback { token in
+            Task { @MainActor [weak self] in
+                // Each request takes exactly one answer, so a host that calls back twice
+                // must not inject a second. `hasResponded` covers that within one cycle;
+                // the sequence check covers a host that answers an OLDER refresh cycle
+                // late, which would otherwise inject a stale token as the answer to the
+                // request currently outstanding.
+                guard !hasResponded, let self, let webView = self.webView else { return }
+                guard requestSeq == zdChatterAuthRequestSeq else { return }
+                hasResponded = true
+                handler.sendZendeskChatterAuthResponse(token: token, to: webView)
+            }
+        }
     }
 
     /// Called for every SDK event (new bridge path).
     public func adaBridge(_: AdaBridgeHandler, didReceiveEvent key: String, data: Any?) {
-        guard let callbacks = eventCallbacks else { return }
         var event: [String: Any] = ["event_name": key]
         if let data { event["data"] = data }
+        dispatchEventToSubscribers(event, rawData: rawSdkEventData(data))
+        guard let callbacks = eventCallbacks else { return }
         callbacks[key]?(event)
         callbacks["*"]?(event)
     }
@@ -196,8 +342,25 @@ extension AdaWebHost: AdaBridgeDelegate {
         debugPrint("[AdaWebHost] Bridge error: \(error)")
         // Surface bridge errors as synthetic events so EventLogView can display them
         // (helps diagnose SDK load failures during E2E testing).
-        guard let callbacks = eventCallbacks else { return }
         let event: [String: Any] = ["event_name": "ada.bridge.error", "error": error]
-        callbacks["*"]?(event)
+        dispatchEventToSubscribers(event, rawData: rawSdkEventData(event))
+        // Historical surface: the single-closure dictionary hears bridge errors
+        // on "*" only.
+        eventCallbacks?["*"]?(event)
+    }
+
+    /// Called when the runtime page reports a failed subresource load.
+    public func adaBridge(_: AdaBridgeHandler, didFailSubresourceLoad details: [String: Any]) {
+        var event: [String: Any] = [
+            "event_name": "ada.webview.subresourceLoadFailed",
+            "url": details["url"] as? String ?? "",
+            "error": "WKWebView failed to load an Ada runtime subresource",
+        ]
+        if let element = details["element"] as? String {
+            event["element"] = element
+        }
+        dispatchEventToSubscribers(event, rawData: rawSdkEventData(event))
+        // Same wildcard-only dictionary delivery as ada.webview.loadFailed.
+        eventCallbacks?["*"]?(event)
     }
 }

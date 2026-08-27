@@ -31,6 +31,11 @@ public enum AdaWebSdk: String, CaseIterable, Sendable {
     case legacy
 }
 
+/// Opaque registration token returned by ``AdaWebHost/addEventCallback(_:callback:)``
+/// and ``AdaWebHost/addSdkEventCallback(_:)``. Pass it back to the matching remove
+/// method to unsubscribe exactly that callback.
+public final class AdaEventSubscription {}
+
 enum AdaResourceBundle {
     static let storyboardName = "AdaWebHostViewController"
 
@@ -77,6 +82,12 @@ public class AdaWebHost: NSObject {
     public var domain = ""
     public var cluster = ""
     public var language = ""
+
+    /// Style overrides. On the Legacy runtime this is a raw CSS string passed to
+    /// `adaEmbed.start`. On the Messaging runtime it must be a JSON object of
+    /// string style tokens (e.g. `{"tintColor": "#520497"}`), sent as the
+    /// `styles` query param on the `sdk/webview.html` URL — any other shape is
+    /// dropped with a debug log. Read during init — set this at init.
     public var styles = ""
     public var greeting = ""
     public var deviceToken = ""
@@ -94,6 +105,18 @@ public class AdaWebHost: NSObject {
     public var zdChatterAuthCallback: ((@escaping (_ token: String) -> Void) -> Void)?
     public var eventCallbacks: [String: (_ event: [String: Any]) -> Void]?
 
+    /// Multi-subscriber per-event-name callbacks registered through
+    /// ``addEventCallback(_:callback:)``. Lives alongside the single-closure
+    /// ``eventCallbacks`` dictionary, which keeps its one-closure-per-key
+    /// semantics for source compatibility.
+    var eventCallbackSubscriptions: [String: [(token: ObjectIdentifier, callback: (_ event: [String: Any]) -> Void)]] =
+        [:]
+
+    /// Raw sinks registered through ``addSdkEventCallback(_:)`` — every SDK
+    /// event as (key, JSON-encoded data), mirroring Android's `addSdkEventCallback`.
+    var sdkEventCallbackSubscriptions: [(token: ObjectIdentifier, callback: (_ key: String, _ data: String?) -> Void)] =
+        []
+
     /// Set modal navigation bar and status bar to grey by default
     public var navigationBarOpaqueBackground = false
 
@@ -108,6 +131,43 @@ public class AdaWebHost: NSObject {
 
     /// Selects which web runtime the native WebView should mount.
     public var webSdk: AdaWebSdk = .legacy
+
+    /// Opts this host into the Messaging runtime's programmatic-control API.
+    ///
+    /// Off by default, so existing integrations are unchanged. While it is off, core rejects
+    /// `sdk.message.send`, `sdk.conversation.get`, `sdk.messages.get` and
+    /// `sdk.composerText.set` with `ProgrammaticControlNotEnabled` — an error naming a
+    /// `start()` option this SDK previously gave the host no way to set.
+    ///
+    /// Named to match the React Native wrapper and the web SDK's `adaSettings` key. Ignored
+    /// on the Legacy runtime, which has no such gate.
+    public var enableProgrammaticControl = false
+
+    /// Suppresses the Messaging runtime's default chat UI so the host app can render
+    /// its own with native components, driven by ``eventCallbacks`` and
+    /// ``sendMessage(_:)``. Sent as the `headless=true` query param on the
+    /// `sdk/webview.html` URL, which is built during init — set this at init.
+    /// Ignored on the Legacy runtime. Pair with ``launchHeadlessWebSupport(in:)``
+    /// to run the WebView without presenting it; that method forces this flag on
+    /// (rebuilding the WebView when the host was created without it).
+    public var headless = false
+
+    /// Short-lived identity token minted by your backend (`POST /v2/auth/tokens/`)
+    /// to authenticate the end user before the session starts. Delivered to the web
+    /// runtime through the one-shot `window.__ADA_WEBVIEW_CONFIG__` global injected
+    /// at document start — never through the URL, so it stays out of request logs.
+    /// The runtime consumes and deletes the global on read. Read during init — set
+    /// this at init. Never persisted natively. Ignored on the Legacy runtime.
+    public var identityToken: String = ""
+
+    /// Overrides the app frame URL the Messaging runtime mounts. The handle's
+    /// Allowed Websites list gates custom apps; add your app's origin in the
+    /// Ada dashboard (Channels > Chat). A URL whose origin the list does not
+    /// allow is dropped and the default app mounts. Leave blank for the standard app.
+    /// Delivered through the one-shot `window.__ADA_WEBVIEW_CONFIG__` global
+    /// alongside ``identityToken``. Read during init — set this at init.
+    /// Ignored on the Legacy runtime.
+    public var appUrl: String = ""
 
     /// Pins the legacy remote host page (`/mobile-sdk-webview/`) to a specific
     /// embed-2 build. Rendered as the `?__ada-embed-version=<sha>` query param
@@ -130,6 +190,14 @@ public class AdaWebHost: NSObject {
     /// Here's where we do our business
     var webView: WKWebView?
 
+    /// Identifies the most recent Zendesk chatter-auth request.
+    ///
+    /// The runtime re-requests on every refresh cycle, so a per-invocation "already
+    /// responded" flag only dedupes a double-callback *within* one cycle. A host that
+    /// answers a cycle late would otherwise inject that stale token as the answer to the
+    /// current request. Only the latest cycle may respond.
+    var zdChatterAuthRequestSeq: UInt64 = 0
+
     /// Key an eye on the network.
     /// `nonisolated(unsafe)` so `deinit` (which is non-isolated) can call
     /// `stopNotifier()`. Safe because teardown is the final access point and
@@ -138,6 +206,30 @@ public class AdaWebHost: NSObject {
 
     /// Keep a reference to the OfflineViewController
     var offlineViewController: OfflineViewController?
+
+    /// Retains the hidden zero-sized container created by
+    /// ``launchHeadlessWebSupport(in:)`` when the caller supplies no host view,
+    /// so the WebView stays alive without any presented UI.
+    var headlessContainer: UIView?
+
+    /// The armed `window.__ADA_WEBVIEW_CONFIG__` document-start script, kept so
+    /// `disarmWebviewConfigScript()` can remove exactly it — and nothing else —
+    /// once the runtime reports ready and the one-shot identity token is spent.
+    var webviewConfigUserScript: WKUserScript?
+
+    /// The identity token the runtime consumed (single-use — an exchange attempt
+    /// spends it even when it fails downstream). A WebView rebuild re-arms the
+    /// document-start config script against a FRESH sessionStorage, so this
+    /// native memo — not the in-script consumed-marker guard — is what keeps a
+    /// spent token from being replayed into the failed-exchange storage wipe
+    /// (mirrors Android's `consumedIdentityToken`).
+    var consumedIdentityToken: String?
+
+    /// The live `WKUserContentController` the WebView was created with.
+    /// `webView.configuration` returns a copy on access, so mutating
+    /// `webView.configuration.userContentController` would not reach the
+    /// running WebView — `disarmWebviewConfigScript()` must use this reference.
+    var webviewUserContentController: WKUserContentController?
 
     /// Keep track of whether the host is loaded
     var webHostLoaded = false {
@@ -208,6 +300,10 @@ public class AdaWebHost: NSObject {
         navigationBarOpaqueBackground: Bool = false,
         environment: AdaEnvironment? = nil,
         webSdk: AdaWebSdk = .legacy,
+        enableProgrammaticControl: Bool = false,
+        headless: Bool = false,
+        identityToken: String = "",
+        appUrl: String = "",
         embedVersion: String = "",
         version: String = "",
         preprodDemoToken: String = "",
@@ -234,6 +330,10 @@ public class AdaWebHost: NSObject {
         self.navigationBarOpaqueBackground = navigationBarOpaqueBackground
         self.environment = environment
         self.webSdk = webSdk
+        self.enableProgrammaticControl = enableProgrammaticControl
+        self.headless = headless
+        self.identityToken = identityToken
+        self.appUrl = appUrl
         self.embedVersion = embedVersion
         self.version = version
         self.preprodDemoToken = preprodDemoToken
@@ -329,6 +429,62 @@ public extension AdaWebHost {
         webView.translatesAutoresizingMaskIntoConstraints = true
         let webController = AdaWebHostViewController.createWebController(with: webView)
         navController.pushViewController(webController, animated: true)
+    }
+
+    /// Run the web runtime without presenting any Ada UI.
+    ///
+    /// Attaches the WebView to `hostView` when one is supplied (keep it hidden or
+    /// zero-sized), or to an internal hidden zero-sized container otherwise.
+    /// Create the host with `headless: true` so the runtime suppresses its own
+    /// chat UI, then drive the conversation natively: subscribe through
+    /// ``eventCallbacks`` and send with ``sendMessage(_:)``.
+    ///
+    /// Lifecycle constraints (see `docs/headless.md`): iOS suspends the WebView's
+    /// content process with the app, so there is no background execution; if the
+    /// app terminates, the session rehydrates from web persistence on the next
+    /// mount; tokens are never persisted natively.
+    ///
+    /// Messaging runtime only: the Legacy runtime has no headless mode, so the
+    /// call traps on it (`precondition`, the Swift equivalent of Android's
+    /// throwing `require`) instead of silently mounting the full legacy chat UI
+    /// inside a hidden container. Forces ``headless`` on: a host created with
+    /// `headless: false` gets its WebView rebuilt so the `headless=true` query
+    /// param reaches the runtime (Android parity: `headlessLaunchSettings`
+    /// normalizes the flag before the view loads).
+    func launchHeadlessWebSupport(in hostView: UIView? = nil) {
+        precondition(
+            webSdk == .messaging,
+            "[AdaWebHost] launchHeadlessWebSupport requires webSdk: .messaging — "
+                + "the Legacy runtime has no headless mode.",
+        )
+        if !headless {
+            // headless rides the webview.html URL built during init, so flipping
+            // the flag alone would change nothing. Teardown first: a replaced-but-
+            // live WebView spends the identityToken — see teardownWebView().
+            headless = true
+            teardownWebView()
+            setupWebView()
+        }
+        guard let webView else { return }
+
+        let container: UIView
+        if let hostView {
+            container = hostView
+        } else {
+            let offscreenContainer = UIView(frame: .zero)
+            offscreenContainer.isHidden = true
+            headlessContainer = offscreenContainer
+            container = offscreenContainer
+        }
+
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(webView)
+        NSLayoutConstraint.activate([
+            container.topAnchor.constraint(equalTo: webView.topAnchor),
+            container.leadingAnchor.constraint(equalTo: webView.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: webView.trailingAnchor),
+            container.bottomAnchor.constraint(equalTo: webView.bottomAnchor),
+        ])
     }
 
     /// Provide a view to inject the web support into
