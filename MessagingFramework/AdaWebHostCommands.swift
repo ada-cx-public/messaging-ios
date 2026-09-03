@@ -280,14 +280,66 @@ public extension AdaWebHost {
         }
     }
 
-    /// Removes the natively persisted state cache (allowlisted, non-sensitive
-    /// startup/branding state in `UserDefaults`) — call on user sign-out or
-    /// whenever recoverable chat state should be discarded. The next WebView
-    /// session starts without rehydrated state. Does not touch the web
-    /// runtime's own storage; use ``deleteHistory()`` or `reset` for the
-    /// conversation itself.
+    /// Removes every natively persisted cache: the allowlisted startup/branding
+    /// state in `UserDefaults` AND the Keychain session mirror for all scopes —
+    /// call on user sign-out or whenever recoverable chat state should be
+    /// discarded. The next WebView session starts without rehydrated state.
+    /// Does not touch the web runtime's own storage; use ``deleteHistory()``
+    /// or `reset` for the conversation itself.
+    ///
+    /// Returns `Void`, preserving the original binary contract — a consumer that
+    /// links against a prebuilt XCFramework built with
+    /// `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` keeps resolving the same mangled
+    /// symbol across a framework swap. Call ``clearPersistedStateDurably()`` when
+    /// you need to know whether the mirror wipe is confirmed durable.
+    ///
+    /// Non-blocking and main-thread-safe: the Keychain wipe is enqueued
+    /// fire-and-forget on the serial mirror queue, so a slow keychain daemon
+    /// cannot hitch the caller. A wipe that does not commit reports the
+    /// `ada.sessionMirror.diagnostic` event with reason `adapter-removeItem-failed`
+    /// to your event callbacks — treat it as "retry the sign-out", because a
+    /// session blob may survive into the next launch.
     func clearPersistedState() {
         bridgeHandler.clearPersistedState()
+        bridgeHandler.clearAllSessionMirrors()
+    }
+
+    /// Sign-out wipe that reports durability: removes the `UserDefaults`
+    /// branding/startup cache AND the Keychain session mirror for all scopes, and
+    /// reports whether the mirror wipe is confirmed gone. On `false` the Keychain
+    /// delete failed or could not be confirmed and a session blob may survive into
+    /// the next launch, so retry rather than treating the sign-out as complete.
+    /// Distinct from ``clearPersistedState()`` so that method's `Void` binary
+    /// contract stays unchanged for XCFramework consumers.
+    ///
+    /// Does not block. The Keychain wipe runs on the process-wide serial mirror queue and
+    /// `completion` is called on the main actor when it reports, so a sign-out on the main actor
+    /// stays responsive however slow the Keychain is. Prefer this over
+    /// ``clearPersistedStateDurably()``, which answers the same question by freezing the caller.
+    func clearPersistedStateDurably(completion: @escaping @MainActor @Sendable (Bool) -> Void) {
+        bridgeHandler.clearPersistedState()
+        bridgeHandler.clearAllSessionMirrorsDurably(completion: completion)
+    }
+
+    /// Blocking variant of ``clearPersistedStateDurably(completion:)`` — same wipe, same
+    /// `false`-means-retry contract, returned inline.
+    ///
+    /// **It blocks the calling thread for up to
+    /// ``AdaBridgeHandler/sessionMirrorClearDurablyTimeout`` seconds, and since ``AdaWebHost`` is
+    /// `@MainActor` that thread is the main one.** There is no off-main call for an actor-correct
+    /// host to make, so a slow Keychain freezes the UI for the whole bound. Use
+    /// ``clearPersistedStateDurably(completion:)`` unless a synchronous answer is unavoidable.
+    ///
+    /// ``AdaBridgeHandler/sessionMirrorClearDurablyStartGrace`` bounds only the wait for the mirror
+    /// queue's head, not the wipe: a Keychain write another mount already accepted is work this
+    /// wipe is ordered behind, and if that stalls you are answered `false` at the grace instead of
+    /// waiting it out. Once the wipe itself starts, the remainder of the bound is all main-thread
+    /// block. The wipe still runs, in order, either way — so `false` means the wipe is unconfirmed
+    /// and you should retry, not that nothing was wiped.
+    @discardableResult
+    func clearPersistedStateDurably() -> Bool {
+        bridgeHandler.clearPersistedState()
+        return bridgeHandler.clearAllSessionMirrorsDurably()
     }
 
     func setLanguage(language: String) {

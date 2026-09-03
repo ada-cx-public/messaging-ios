@@ -7,7 +7,7 @@ import Foundation
 
 enum AdaMessagingVersion {
     static let placeholderVersion = "0.0.0"
-    static let packageVersion = "1.2.0"
+    static let packageVersion = "1.3.0"
 
     private static let semverPattern = #"^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"#
 

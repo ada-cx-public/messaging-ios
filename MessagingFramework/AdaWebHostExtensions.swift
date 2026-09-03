@@ -43,10 +43,12 @@ extension AdaWebHost {
         let userContentController = WKUserContentController()
         configuration.userContentController = userContentController
         webviewUserContentController = userContentController
+        entryDocumentUrl = resolveEntryDocumentUrl()
         registerMessageHandlers(on: userContentController)
 
         webView = WKWebView(frame: .zero, configuration: configuration)
         guard let webView else { return }
+        bridgeHandler.sessionMirrorCommandWebView = webView
         webView.scrollView.isScrollEnabled = false
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -101,6 +103,11 @@ extension AdaWebHost {
         }
         webviewConfigUserScript = nil
         webviewUserContentController = nil
+        entryDocumentUrl = nil
+        bridgeHandler.sessionMirrorCommandWebView = nil
+        // No entry document means no ticket, so nothing can be injected into whatever the
+        // torn-down WebView still holds while the replacement is built.
+        bridgeHandler.trustedDocumentUrl = nil
 
         if let replacedWebView = webView {
             // Also keeps the load-timeout Task's late `isLoading` check from
@@ -129,16 +136,47 @@ extension AdaWebHost {
         UInt64((max(0, seconds) * 1_000_000_000).rounded())
     }
 
+    /// The document this mount points the WebView at, resolved once so the value pinned as the
+    /// injection authority is the same string the WebView is asked to load.
+    private func resolveEntryDocumentUrl() -> URL? {
+        if usesBridgeRuntime {
+            return environment.flatMap { buildWebviewUrl(environment: $0) }
+        }
+        return legacyMobileSdkWebviewUrl()
+    }
+
     private func registerMessageHandlers(on userContentController: WKUserContentController) {
+        bridgeHandler.sessionMirrorLegacyScopePrefix = legacySessionMirrorScopePrefix()
+        // Fails closed: mirror writes and clears are dropped until a runtime
+        // is pinned below. The localhost-Legacy bridge runtime never pins one
+        // — its page drives no mirror.
+        bridgeHandler.sessionMirrorRuntime = nil
+        // Fails closed the same way: no pinned entry document means no ticket, so no injection.
+        bridgeHandler.trustedDocumentUrl = nil
+        // Reinstall wipe must run before any mirror injection script is built.
+        bridgeHandler.sessionMirrorStore.prepareForLaunch()
+
         if usesBridgeRuntime {
             // Same trusted origin the config script is scoped to: the host page
             // the WebView loads. Fails closed — with no resolvable origin the
             // handler drops every message.
             bridgeHandler.trustedOrigin = environment.flatMap { Self.pageOrigin(ofUrl: $0.webviewHtmlUrl) }
+            // The origin is the whole CDN root, which also serves other bots' runs and other
+            // entries; the start parameters that decide WHOSE session this is ride the query.
+            bridgeHandler.trustedDocumentUrl = entryDocumentUrl?.absoluteString
             userContentController.add(bridgeHandler, name: "adaBridge")
 
             if let initialStateScript = bridgeHandler.makeInitialStateScript() {
                 userContentController.addUserScript(initialStateScript)
+            }
+
+            // Messaging only: a localhost-Legacy run of the same config must
+            // neither accept mirror writes nor answer the seed pull with the
+            // Messaging blob (JWT + refresh token).
+            if webSdk == .messaging {
+                bridgeHandler.sessionMirrorRuntime = .messaging(
+                    scopePrefix: messagingSessionMirrorScopePrefix(),
+                )
             }
 
             if let webviewConfigScript = makeWebviewConfigScript() {
@@ -152,14 +190,60 @@ extension AdaWebHost {
             userContentController.add(self, name: "eventCallbackHandler")
             userContentController.add(self, name: "zdChatterAuthCallbackHandler")
             userContentController.add(self, name: "chatFrameTimeoutCallbackHandler")
+            registerLegacySessionMirror(on: userContentController)
         }
+    }
+
+    /// The remote Legacy page persists the 5 legacy session keys in its own
+    /// bot-domain localStorage, so the mirror there is driven entirely by one
+    /// injected script with zero legacy-chat code changes: it pulls the seed
+    /// from native at boot, adopts/watches it, and posts its
+    /// `sdk.session.mirror(Clear)` / `sdk.session.mirrorRequest` messages
+    /// through the same origin-gated bridge handler. No frozen document-start
+    /// blob is injected — the pull answers live, so a clear cannot resurrect.
+    private func registerLegacySessionMirror(on userContentController: WKUserContentController) {
+        guard let pageUrl = entryDocumentUrl,
+              let pageOrigin = Self.pageOrigin(ofUrl: pageUrl.absoluteString)
+        else { return }
+
+        bridgeHandler.trustedOrigin = pageOrigin
+        bridgeHandler.trustedDocumentUrl = pageUrl.absoluteString
+        userContentController.add(bridgeHandler, name: "adaBridge")
+
+        let scopeKey = legacySessionMirrorScopeKey(pageOrigin: pageOrigin)
+        bridgeHandler.sessionMirrorRuntime = .legacy(scopeKey: scopeKey)
+        if let legacyScript = bridgeHandler.makeLegacySessionMirrorScript(scopeKey: scopeKey) {
+            userContentController.addUserScript(legacyScript)
+        }
+    }
+
+    /// Scope key for a Legacy host page's mirror blob — pinned to the
+    /// cross-package contract's `ada-session-mirror:legacy:<handle>:<origin>`
+    /// shape (the Messaging runtime computes its own scope key web-side).
+    func legacySessionMirrorScopeKey(pageOrigin: String) -> String {
+        legacySessionMirrorScopePrefix() + pageOrigin
+    }
+
+    /// Prefix of every Legacy scope key this instance's handle can produce.
+    /// Handed to the bridge handler so Legacy blobs never enter the instance
+    /// index and are never injected on the Messaging path.
+    func legacySessionMirrorScopePrefix() -> String {
+        "ada-session-mirror:legacy:\(handle):"
+    }
+
+    /// Prefix of every Messaging-run scope key this instance's handle can
+    /// produce — `buildSessionMirrorScopeKey` web-side yields
+    /// `ada-session-mirror:<handle>:<scope>`. Pins which writes the Messaging
+    /// runtime may store.
+    func messagingSessionMirrorScopePrefix() -> String {
+        "ada-session-mirror:\(handle):"
     }
 
     private func loadInitialRequest(into webView: WKWebView, userContentController: WKUserContentController) {
         if usesBridgeRuntime, let env = environment {
             userContentController.addUserScript(errorInterceptorScript())
 
-            if let url = buildWebviewUrl(environment: env) {
+            if let url = entryDocumentUrl {
                 setPreprodDemoCookieIfNeeded(environment: env, in: webView) {
                     webView.load(self.buildWebviewRequest(url: url, environment: env))
                 }
@@ -167,7 +251,7 @@ extension AdaWebHost {
             return
         }
 
-        guard let remoteURL = legacyMobileSdkWebviewUrl() else { return }
+        guard let remoteURL = entryDocumentUrl else { return }
         let webRequest = URLRequest(
             url: remoteURL,
             cachePolicy: .useProtocolCachePolicy,
@@ -305,7 +389,7 @@ extension AdaWebHost {
         return String(hash, radix: 16)
     }
 
-    private func jsonObjectString(_ object: [String: String]) -> String? {
+    private func jsonObjectString(_ object: [String: Any]) -> String? {
         guard let data = try? JSONSerialization.data(withJSONObject: object),
               let json = String(data: data, encoding: .utf8) else { return nil }
         return json
@@ -352,7 +436,16 @@ extension AdaWebHost {
             )
             trimmedIdentityToken = ""
         }
-        var retainedConfig: [String: String] = [:]
+        // Native-capability handshake (EXP-1082): only a native version that
+        // implements the sdk.session.mirror(Clear) handlers and emits
+        // ada.sessionMirrorClearAck advertises support, so the CDN web runtime —
+        // instant and unversioned — arms the mirror + durable-clear barrier only
+        // inside this version or newer. Older wrappers omit the field, the SDK
+        // reads it absent, and the mirror degrades cleanly to pre-EXP-1082
+        // behavior. A real JSON boolean, not a string: the SDK gate compares
+        // `=== true`. Kept in `retainedConfig` so it rides every document (and
+        // folds into `fullConfig` below), exactly like `appUrl`.
+        var retainedConfig: [String: Any] = ["nativeSessionMirrorSupported": true]
         let trimmedAppUrl = appUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedAppUrl.isEmpty {
             retainedConfig["appUrl"] = trimmedAppUrl

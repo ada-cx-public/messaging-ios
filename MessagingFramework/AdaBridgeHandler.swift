@@ -32,6 +32,29 @@ import WebKit
 
 // ---------------------------------------------------------------------------
 
+// MARK: - AdaDocumentTicket
+
+// ---------------------------------------------------------------------------
+
+/// The authority to write into the document a request was accepted from.
+///
+/// One value answers every question a deferred injection has to ask:
+///  - which WebView, so a rebuilt one (``AdaWebHost/hardResetWebView()``) cannot be written
+///    into with a ticket minted against its predecessor;
+///  - which main document, by its full URL — the start parameters this run was launched with
+///    ride the query, and an in-place main-frame navigation replaces the document without
+///    touching the WebView at all.
+///
+/// Minted only for the entry document the wrapper loaded — pinned `trustedOrigin`, same entry
+/// path, same query signature — so a page that was never the Ada runtime mints nothing and no
+/// deferred reply can reach it.
+struct AdaDocumentTicket: Equatable {
+    let webView: ObjectIdentifier
+    let documentUrl: String
+}
+
+// ---------------------------------------------------------------------------
+
 // MARK: - AdaBridgeDelegate
 
 // ---------------------------------------------------------------------------
@@ -77,6 +100,9 @@ import WebKit
 /// // Origin of the page you load below — messages from any other origin
 /// // (or from a subframe) are dropped.
 /// handler.trustedOrigin = "https://example.ada.support"
+/// // The exact document you load below, query included. Commands are injected only
+/// // into that document; leaving it unset injects nothing.
+/// handler.trustedDocumentUrl = "https://example.ada.support/sdk/webview.html?handle=example"
 ///
 /// let config = WKWebViewConfiguration()
 /// config.userContentController.add(handler, name: "adaBridge")
@@ -106,6 +132,26 @@ import WebKit
     /// scoping and `isMainFrame` gate on `addWebMessageListener`).
     public var trustedOrigin: String?
 
+    /// Full URL of the entry document the WebView was pointed at, query included
+    /// (`AdaWebHost.entryDocumentUrl` supplies it). ``trustedOrigin`` alone is not identity: it is
+    /// the whole Ada CDN root, which serves every bot's run of `sdk/webview.html` and a second
+    /// top-level entry (`sdk/chat.html`) besides, while the parameters that decide WHOSE session a
+    /// document boots — `handle`, `ada_handle`, `cluster`, `ada_cluster`, metaFields — ride the
+    /// query. Without this, a subframe that navigates the main frame to another same-origin
+    /// document is minted a fresh ticket and receives the host's `setSensitiveMetaFields` /
+    /// `setDeviceToken` and the session-mirror seed. `nil` fails closed: no ticket is minted at all.
+    public var trustedDocumentUrl: String? {
+        didSet {
+            // Binding a document resets the diagnostic dedupe, matching Android's
+            // `bindDocument`. The dedupe is per DOCUMENT, not per host: a fresh
+            // document can hit the same failure again, and a host that never hears
+            // the second one cannot tell a one-off from a persistent degradation —
+            // which matters most for `adapter-removeItem-failed`, whose documented
+            // contract is that the host retries the sign-out.
+            reportedSessionMirrorDiagnostics.removeAll()
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Private
     // -----------------------------------------------------------------------
@@ -116,6 +162,88 @@ import WebKit
     private let userDefaults: UserDefaults
     private var cachedState: [String: Any]?
 
+    /// Keychain-backed native session mirror (EXP-1082) — a separate channel
+    /// from the branding cache above: no TTL, wiped only by explicit clears.
+    let sessionMirrorStore: AdaSessionMirrorStore
+
+    /// `"ada-session-mirror:legacy:<handle>:"` — the prefix every Legacy-run
+    /// scope key for this instance's handle carries, so a Messaging-pinned
+    /// runtime can refuse a legacy-shaped scope key.
+    var sessionMirrorLegacyScopePrefix: String?
+
+    /// The runtime the wrapper pinned for this webview — the authority for
+    /// classifying `sdk.session.mirror(Clear)` messages. A message's own
+    /// `scopeKey` is page-supplied and must match this runtime's
+    /// natively-computed grammar or the message is dropped. `nil` fails
+    /// closed: every mirror write and clear is dropped.
+    var sessionMirrorRuntime: AdaSessionMirrorRuntime?
+
+    /// WebView the session-mirror command replies are dispatched into — the
+    /// `ada.sessionMirrorClearAck` and the pull `sdk.sessionMirror.seed` reply.
+    weak var sessionMirrorCommandWebView: WKWebView?
+
+    /// Host event key carrying an ``AdaSessionMirrorDiagnosticReason``. Shared with
+    /// Android and React Native's `ada.sessionMirror.diagnostic`, so one host handler
+    /// reads every wrapper.
+    static let sessionMirrorDiagnosticEventKey = "ada.sessionMirror.diagnostic"
+
+    /// Reasons already reported, so a Keychain failing on every mirror message reports
+    /// once rather than once per message.
+    var reportedSessionMirrorDiagnostics: Set<AdaSessionMirrorDiagnosticReason> = []
+
+    /// Upper bound on how long ``AdaWebHostCommands/clearPersistedStateDurably()`` blocks its
+    /// caller — the main thread, since ``AdaWebHost`` is `@MainActor` — waiting for the off-thread
+    /// mirror wipe to report. A wipe that has not settled within this window returns `false`
+    /// rather than stranding the caller. It bounds the freeze; it does not avoid one, which is why
+    /// ``AdaWebHostCommands/clearPersistedStateDurably(completion:)`` exists.
+    static let sessionMirrorClearDurablyTimeout: TimeInterval = 3
+
+    /// How much of ``sessionMirrorClearDurablyTimeout`` a durable clear may spend waiting for
+    /// its wipe to reach the head of the mirror queue, as opposed to waiting for the wipe
+    /// itself. The queue below is process-wide, so the wipe can sit behind a Keychain write
+    /// another mount already accepted — correct ordering, but a wait worth cutting short, because
+    /// the wipe could not have been confirmed inside it anyway. Past this grace the caller is
+    /// answered `false` (its documented retry signal) while the wipe stays queued and still runs
+    /// in order. Wide enough to absorb thread wake-up plus one ordinary Keychain round-trip ahead
+    /// of the wipe.
+    ///
+    /// It does NOT make the blocking call main-actor-safe: once the wipe reaches the head of the
+    /// queue this grace is satisfied, and a wipe that then stalls blocks for the remainder of
+    /// ``sessionMirrorClearDurablyTimeout``.
+    static let sessionMirrorClearDurablyStartGrace: TimeInterval = 0.25
+
+    /// Serial queue that carries every session-mirror Keychain mutation (store,
+    /// clear, clearAll) off the `WKScriptMessageHandler` main-thread delivery.
+    /// `SecItemAdd`/`SecItemUpdate`/`SecItemDelete` are synchronous disk I/O; a
+    /// slow keychain daemon would otherwise hitch the UI. Ordering is FIFO, so a
+    /// clear runs after every write already enqueued.
+    ///
+    /// Process-wide, because the store it orders is: the Keychain is app-scoped
+    /// while a handler is per mount, and unmounting a handler does not cancel the
+    /// work it already enqueued. A queue per handler orders each mount's own
+    /// messages and nothing else, so a second mount's pending write runs
+    /// concurrently with the app-scoped sign-out wipe — the wipe verifies the
+    /// store empty, reports success, and that write then re-commits the
+    /// signed-out session's blob behind it. One shared queue is what makes the
+    /// FIFO guarantee above hold against every handler in the process.
+    private nonisolated static let sessionMirrorKeychainQueue = DispatchQueue(
+        label: "cx.ada.messaging.session-mirror.keychain",
+    )
+
+    /// Runs a session-mirror Keychain mutation off the main thread. Default is
+    /// the shared serial queue above; tests substitute an inline runner so the
+    /// delete-before-ack ordering is observable synchronously.
+    var sessionMirrorKeychainRunner: (@escaping () -> Void) -> Void = { work in
+        AdaBridgeHandler.sessionMirrorKeychainQueue.async(execute: work)
+    }
+
+    /// Marshals a session-mirror command reply — the clear ack and the pull seed
+    /// reply, both of which call `evaluateJavaScript` — back to the main thread.
+    /// Tests substitute an inline runner.
+    var sessionMirrorMainRunner: (@escaping () -> Void) -> Void = { work in
+        DispatchQueue.main.async(execute: work)
+    }
+
     // -----------------------------------------------------------------------
 
     // MARK: - Initialisers
@@ -125,6 +253,7 @@ import WebKit
     /// Default initialiser — uses `UserDefaults.standard`.
     override public init() {
         userDefaults = .standard
+        sessionMirrorStore = AdaSessionMirrorStore()
         super.init()
     }
 
@@ -132,6 +261,15 @@ import WebKit
     /// run in isolation without touching `UserDefaults.standard`.
     init(userDefaults: UserDefaults) {
         self.userDefaults = userDefaults
+        sessionMirrorStore = AdaSessionMirrorStore(userDefaults: userDefaults)
+        super.init()
+    }
+
+    /// Testing initialiser — additionally injects the session-mirror store so
+    /// tests can substitute an in-memory Keychain fake.
+    init(userDefaults: UserDefaults, sessionMirrorStore: AdaSessionMirrorStore) {
+        self.userDefaults = userDefaults
+        self.sessionMirrorStore = sessionMirrorStore
         super.init()
     }
 
@@ -295,6 +433,10 @@ import WebKit
                 persistState(state)
             }
 
+        case "sdk.session.mirror", "sdk.session.mirrorClear", "sdk.session.mirrorRequest",
+             "sdk.session.mirrorDiagnostic":
+            routeSessionMirrorMessage(type: type, body: body)
+
         case "sdk.zdChatterAuthRequest":
             delegate?.adaBridgeDidRequestZendeskChatterAuth?(self)
 
@@ -369,10 +511,65 @@ import WebKit
         guard let data = try? JSONEncoder().encode(command),
               let json = String(data: data, encoding: .utf8)
         else { return }
+        dispatchCommandJson(json, to: webView, ticket: captureDocumentTicket(for: webView))
+    }
 
-        let escaped = AdaBridgeHandler.escapedForTemplateLiteral(json)
-        let script = "if(window.__ADA_BRIDGE_DISPATCH__){window.__ADA_BRIDGE_DISPATCH__(`\(escaped)`)}true;"
+    // -----------------------------------------------------------------------
+
+    // MARK: - Document ticketing
+
+    // -----------------------------------------------------------------------
+
+    /// The live main-document URL of `webView`. Instance-level so tests can simulate a
+    /// main-frame navigation — `WKWebView.url` is read-only and a test bundle cannot load a
+    /// document into a WebView.
+    func liveDocumentUrl(of webView: WKWebView) -> String? {
+        webView.url?.absoluteString
+    }
+
+    /// Mints the authority of the document currently occupying `webView`'s main frame, or
+    /// `nil` when there is no document worth writing into. Call it when a request is
+    /// ACCEPTED and redeem the result at injection time: WebKit reports the live main-document
+    /// URL, so a document swapped in between the two mints a different ticket and the
+    /// injection is dropped.
+    ///
+    /// Minted only for the document this mount actually loaded — origin, entry and query
+    /// signature all compared (``AdaWebHost/isRuntimeDocumentUrl(_:entryDocumentUrl:)``). Comparing
+    /// the origin alone would let a replacement document mint its OWN fresh ticket, so an attacker
+    /// would need no outstanding ticket at all: the redemption check, which compares the full URL,
+    /// only catches a swap that happens after a mint.
+    func captureDocumentTicket(for webView: WKWebView) -> AdaDocumentTicket? {
+        guard let trustedOrigin,
+              let trustedDocumentUrl,
+              let documentUrl = liveDocumentUrl(of: webView),
+              AdaWebHost.pageOrigin(ofUrl: documentUrl) == trustedOrigin,
+              AdaWebHost.isRuntimeDocumentUrl(documentUrl, entryDocumentUrl: trustedDocumentUrl)
+        else { return nil }
+        return AdaDocumentTicket(webView: ObjectIdentifier(webView), documentUrl: documentUrl)
+    }
+
+    /// The only `evaluateJavaScript` call site in this class, so a new injection sink cannot
+    /// half-implement the guard: without a ticket it has nothing to inject through. Re-mints
+    /// on redemption and refuses anything but an exact match.
+    @discardableResult
+    func injectIntoDocument(_ ticket: AdaDocumentTicket?, script: String, to webView: WKWebView) -> Bool {
+        guard let ticket, ticket == captureDocumentTicket(for: webView) else { return false }
         webView.evaluateJavaScript(script, completionHandler: nil)
+        return true
+    }
+
+    /// Dispatches a session-mirror reply and reports the refusal when the document that asked is
+    /// gone. Ordinary commands stay on the silent ``dispatchCommand(_:to:ticket:)`` path: a dropped
+    /// `ada.setLanguage` is not a mirror degradation, and reporting it under the mirror's event key
+    /// would cost that channel its meaning.
+    private func dispatchSessionMirrorReply(
+        _ command: [String: Any],
+        to webView: WKWebView,
+        ticket: AdaDocumentTicket?,
+    ) {
+        if !dispatchCommand(command, to: webView, ticket: ticket) {
+            emitSessionMirrorDiagnostic(.documentMismatch)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -392,6 +589,7 @@ import WebKit
                 "payload": ["token": token.map { $0 as Any } ?? NSNull()],
             ],
             to: webView,
+            ticket: captureDocumentTicket(for: webView),
         )
     }
 
@@ -403,6 +601,7 @@ import WebKit
                 "payload": ["fields": fields],
             ],
             to: webView,
+            ticket: captureDocumentTicket(for: webView),
         )
     }
 
@@ -414,27 +613,44 @@ import WebKit
                 "payload": ["fields": fields],
             ],
             to: webView,
+            ticket: captureDocumentTicket(for: webView),
         )
     }
 
     /// Set the push-notification device token.
     public func setDeviceToken(_ token: String, to webView: WKWebView) {
-        dispatchCommand(["type": "ada.setDeviceToken", "payload": ["token": token]], to: webView)
+        dispatchCommand(
+            ["type": "ada.setDeviceToken", "payload": ["token": token]],
+            to: webView,
+            ticket: captureDocumentTicket(for: webView),
+        )
     }
 
     /// Change the display language.
     public func setLanguage(_ language: String, to webView: WKWebView) {
-        dispatchCommand(["type": "ada.setLanguage", "payload": ["language": language]], to: webView)
+        dispatchCommand(
+            ["type": "ada.setLanguage", "payload": ["language": language]],
+            to: webView,
+            ticket: captureDocumentTicket(for: webView),
+        )
     }
 
     /// Programmatically send a user message into the conversation.
     public func sendMessage(_ body: String, to webView: WKWebView) {
-        dispatchCommand(["type": "ada.sendMessage", "payload": ["body": body]], to: webView)
+        dispatchCommand(
+            ["type": "ada.sendMessage", "payload": ["body": body]],
+            to: webView,
+            ticket: captureDocumentTicket(for: webView),
+        )
     }
 
     /// Delete chat history and reset the session.
     public func deleteHistory(to webView: WKWebView) {
-        dispatchCommand(["type": "ada.deleteHistory"], to: webView)
+        dispatchCommand(
+            ["type": "ada.deleteHistory"],
+            to: webView,
+            ticket: captureDocumentTicket(for: webView),
+        )
     }
 
     /// Reset the Ada session with optional language, greeting, meta-fields, and history flags.
@@ -460,19 +676,73 @@ import WebKit
         if let metaFields { payload["metaFields"] = metaFields }
         if let sensitiveMetaFields { payload["sensitiveMetaFields"] = sensitiveMetaFields }
         if let resetChatHistory { payload["resetChatHistory"] = resetChatHistory }
-        dispatchCommand(["type": "ada.reset", "payload": payload], to: webView)
+        dispatchCommand(
+            ["type": "ada.reset", "payload": payload],
+            to: webView,
+            ticket: captureDocumentTicket(for: webView),
+        )
+    }
+
+    /// Acknowledges a durably committed session-mirror clear back into the web
+    /// runtime. Must only be called AFTER the store delete returned success —
+    /// the web-side MES-1376 barrier treats this ack as proof the native blob
+    /// can no longer resurrect the cleared session, so a failed or unverified
+    /// delete must time out unacked instead.
+    ///
+    /// `ticket` is the document that asked. The delete runs off the main thread, so by the
+    /// time it reports, the asking document may be gone; a dropped ack times the web side
+    /// out, which tombstones the blob — the safe direction.
+    func acknowledgeSessionMirrorClear(requestId: String, ticket: AdaDocumentTicket?) {
+        guard let webView = sessionMirrorCommandWebView else { return }
+        dispatchSessionMirrorReply(
+            ["type": "ada.sessionMirrorClearAck", "requestId": requestId],
+            to: webView,
+            ticket: ticket,
+        )
+    }
+
+    /// Dispatches the session-mirror pull response into the web runtime through the same typed
+    /// command path the clear-ack uses. On the Messaging page the SDK bridge adapter routes
+    /// `sdk.sessionMirror.seed`; on the Legacy page the injected bootstrap script defines its
+    /// own `__ADA_BRIDGE_DISPATCH__` receiver for it. An absent blob is sent as an explicit
+    /// `null` seed; `ticket` pins the reply to the document that asked.
+    ///
+    /// Lives in the class body rather than beside its caller in `AdaSessionMirrorStore.swift`
+    /// because a ticket is not ObjC-representable, so the method is not implicitly `@objc` and
+    /// an extension declaration could not be overridden by the test spy.
+    func deliverSessionMirrorSeed(requestId: String, seed: [String: Any]?, ticket: AdaDocumentTicket?) {
+        guard let webView = sessionMirrorCommandWebView else { return }
+        dispatchSessionMirrorReply(
+            ["type": "sdk.sessionMirror.seed", "requestId": requestId, "seed": seed ?? NSNull()],
+            to: webView,
+            ticket: ticket,
+        )
     }
 
     /// Serialise a `[String: Any]` command dict and dispatch it to the WebView.
     /// Used by typed convenience methods; `sendCommand<T: Encodable>` is
     /// preferred when a `Codable` command struct is available.
-    func dispatchCommand(_ command: [String: Any], to webView: WKWebView) {
+    ///
+    /// `ticket` has no default on purpose. A caller answering a request the page made
+    /// captures it when the request is accepted and passes that value here; a caller issuing
+    /// a host command mints one inline, which is what makes the command apply to whatever
+    /// runtime document is live rather than a departed one.
+    @discardableResult
+    func dispatchCommand(_ command: [String: Any], to webView: WKWebView, ticket: AdaDocumentTicket?) -> Bool {
         guard let data = try? JSONSerialization.data(withJSONObject: command),
               let json = String(data: data, encoding: .utf8)
-        else { return }
+        else { return false }
+        return dispatchCommandJson(json, to: webView, ticket: ticket)
+    }
+
+    @discardableResult
+    private func dispatchCommandJson(_ json: String, to webView: WKWebView, ticket: AdaDocumentTicket?) -> Bool {
         let escaped = AdaBridgeHandler.escapedForTemplateLiteral(json)
-        let script = "if(window.__ADA_BRIDGE_DISPATCH__){window.__ADA_BRIDGE_DISPATCH__(`\(escaped)`)}true;"
-        webView.evaluateJavaScript(script, completionHandler: nil)
+        return injectIntoDocument(
+            ticket,
+            script: "if(window.__ADA_BRIDGE_DISPATCH__){window.__ADA_BRIDGE_DISPATCH__(`\(escaped)`)}true;",
+            to: webView,
+        )
     }
 
     // -----------------------------------------------------------------------

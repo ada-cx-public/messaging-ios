@@ -155,37 +155,40 @@ extension AdaWebHost {
             let greetingJson = jsonStr(greeting)
             let deviceTokenJson = jsonStr(deviceToken)
 
-            evalJS("""
-                (function() {
-                    window.adaEmbed.start({
-                        handle: \(handleJson),
-                        cluster: \(clusterJson),
-                        domain: \(domainJson),
-                        language: \(languageJson),
-                        styles: \(stylesJson),
-                        greeting: \(greetingJson),
-                        metaFields: \(metaFieldsJson),
-                        hostTelemetry: \(hostTelemetryJson),
-                        sensitiveMetaFields: \(sensitiveMetaFieldsJson),
-                        parentElement: "parent-element",
-                        onAdaEmbedLoaded: () => {
-                            adaEmbed.setDeviceToken(\(deviceTokenJson));
-                            adaEmbed.subscribeEvent("ada:chat_frame_timeout", (data, context) => {
-                                window.webkit.messageHandlers
-                                    .chatFrameTimeoutCallbackHandler
-                                    .postMessage("chatFrameTimeout");
-                            });
-                        },
-                        zdChatterAuthCallback: function(callback) {
-                            window.zdTokenCallback = callback;
-                            window.webkit.messageHandlers.zdChatterAuthCallbackHandler.postMessage("getToken");
-                        },
-                        eventCallbacks: {
-                            "*": (event) => window.webkit.messageHandlers.eventCallbackHandler.postMessage(event)
-                        }
-                    });
-                })();
-            """)
+            let startBody = """
+                window.adaEmbed.start({
+                    handle: \(handleJson),
+                    cluster: \(clusterJson),
+                    domain: \(domainJson),
+                    language: \(languageJson),
+                    styles: \(stylesJson),
+                    greeting: \(greetingJson),
+                    metaFields: \(metaFieldsJson),
+                    hostTelemetry: \(hostTelemetryJson),
+                    sensitiveMetaFields: \(sensitiveMetaFieldsJson),
+                    parentElement: "parent-element",
+                    onAdaEmbedLoaded: () => {
+                        adaEmbed.setDeviceToken(\(deviceTokenJson));
+                        adaEmbed.subscribeEvent("ada:chat_frame_timeout", (data, context) => {
+                            window.webkit.messageHandlers
+                                .chatFrameTimeoutCallbackHandler
+                                .postMessage("chatFrameTimeout");
+                        });
+                    },
+                    zdChatterAuthCallback: function(callback) {
+                        window.zdTokenCallback = callback;
+                        window.webkit.messageHandlers.zdChatterAuthCallbackHandler.postMessage("getToken");
+                    },
+                    eventCallbacks: {
+                        "*": (event) => window.webkit.messageHandlers.eventCallbackHandler.postMessage(event)
+                    }
+                });
+            """
+            // Under the pull transport the injected legacy bootstrap script
+            // itself holds and releases `adaEmbed.start` around its bounded
+            // pre-start step, so start is evaluated directly here (no native
+            // resolved-mode barrier wrapper).
+            evalJS(startBody)
         } catch {
             debugPrint("Serialization error: \(error.localizedDescription)")
         }
@@ -199,6 +202,17 @@ extension AdaWebHost {
         return json
     }
 
+    /// The legacy host page's `adaEmbed.*` command sink. Commands issued before the page
+    /// reports ready are queued and replayed, so the document they land in is decided at
+    /// replay time, not at call time — and `webHostLoaded` alone does not notice a top-level
+    /// navigation that replaced the page in place. `setSensitiveMetaFields` travels this path,
+    /// so the check is on the live main document, not just on the WebView being alive.
+    ///
+    /// Gated on the same document ticket every bridge injection is gated on, not on the origin:
+    /// the legacy page's own origin also serves whatever else the bot's host does, and the
+    /// build-version parameters the page reads ride its query, so an origin comparison passes a
+    /// same-origin replacement carrying parameters an attacker chose. Fails closed — a mount that
+    /// pins no entry document loaded no page either, so there is nothing to command.
     func evalJS(_ toRun: String) {
         guard webHostLoaded else {
             pendingCommands.append { [weak self] in
@@ -206,7 +220,7 @@ extension AdaWebHost {
             }
             return
         }
-        guard let webView else { return }
+        guard let webView, bridgeHandler.captureDocumentTicket(for: webView) != nil else { return }
 
         webView.evaluateJavaScript(toRun) { _, error in
             if let err = error {

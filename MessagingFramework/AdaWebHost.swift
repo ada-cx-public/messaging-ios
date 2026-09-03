@@ -190,6 +190,13 @@ public class AdaWebHost: NSObject {
     /// Here's where we do our business
     var webView: WKWebView?
 
+    /// The document this mount points the WebView at — `sdk/webview.html` with this run's start
+    /// parameters on the bridge runtime, `/mobile-sdk-webview/` on the legacy remote page. It is
+    /// the identity every injection and every top-level navigation is judged against, so it is
+    /// resolved ONCE per WebView and reused for the load: rebuilding it per comparison would let
+    /// a re-serialized `metaFields` query drift from the URL that was actually loaded.
+    var entryDocumentUrl: URL?
+
     /// Identifies the most recent Zendesk chatter-auth request.
     ///
     /// The runtime re-requests on every refresh cycle, so a per-invocation "already

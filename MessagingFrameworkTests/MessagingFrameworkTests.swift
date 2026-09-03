@@ -580,10 +580,19 @@ private final class SpyDelegate: NSObject, AdaBridgeDelegate {
 
 /// `WKWebView` subclass that captures `evaluateJavaScript` calls without executing them.
 /// `evaluateJavaScript` is `open` in WebKit — this override is supported.
-private final class ScriptCapturingWebView: WKWebView {
+///
+/// `url` is overridden for the same reason: a test bundle cannot load a document, and the
+/// document ticket that authorizes every injection reads the live main-document URL. Assigning
+/// `documentUrl` is how a test says "the main frame now holds this document", including the
+/// hostile case where it holds someone else's.
+final class ScriptCapturingWebView: WKWebView {
     var capturedScripts: [String] = []
+    var documentUrl: URL?
 
-    init() {
+    override var url: URL? { documentUrl }
+
+    init(documentUrl: URL? = URL(string: "https://messaging-assets.ada.support/sdk/webview.html")) {
+        self.documentUrl = documentUrl
         super.init(frame: .zero, configuration: WKWebViewConfiguration())
     }
 
@@ -597,6 +606,18 @@ private final class ScriptCapturingWebView: WKWebView {
         completionHandler _: (@MainActor @Sendable (Any?, (any Error)?) -> Void)? = nil,
     ) {
         capturedScripts.append(javaScriptString)
+    }
+}
+
+@MainActor
+extension ScriptCapturingWebView {
+    /// Mounts a capturing WebView on the host's OWN entry document — the URL the real WKWebView
+    /// holds once the load lands, and the one every injection is authorized against. A fake
+    /// mounted on some other same-origin URL is a replacement document, not the runtime.
+    static func mounted(on host: AdaWebHost) -> ScriptCapturingWebView {
+        let webView = ScriptCapturingWebView(documentUrl: host.entryDocumentUrl)
+        host.webView = webView
+        return webView
     }
 }
 
@@ -865,14 +886,26 @@ extension AdaBridgeHandlerTests {
 extension AdaBridgeHandlerTests {
     @MainActor struct DispatchCommandTests {
         private func makeHandler() -> AdaBridgeHandler {
-            AdaBridgeHandler(userDefaults: UserDefaults(suiteName: "com.ada.bridge.test.\(UUID().uuidString)")!)
+            let handler = AdaBridgeHandler(
+                userDefaults: UserDefaults(suiteName: "com.ada.bridge.test.\(UUID().uuidString)")!,
+            )
+            // Every dispatch is authorized against the live main document, so a handler that pins
+            // no entry document injects nothing. `ScriptCapturingWebView` defaults to exactly this
+            // document.
+            handler.trustedOrigin = "https://messaging-assets.ada.support"
+            handler.trustedDocumentUrl = "https://messaging-assets.ada.support/sdk/webview.html"
+            return handler
         }
 
         @Test
         func `script uses the __ADA_BRIDGE_DISPATCH__ template`() throws {
             let handler = makeHandler()
             let webView = ScriptCapturingWebView()
-            handler.dispatchCommand(["type": "ada.setLanguage", "payload": ["language": "fr"]], to: webView)
+            handler.dispatchCommand(
+                ["type": "ada.setLanguage", "payload": ["language": "fr"]],
+                to: webView,
+                ticket: handler.captureDocumentTicket(for: webView),
+            )
             let script = try #require(webView.capturedScripts.first)
             #expect(script.hasPrefix("if(window.__ADA_BRIDGE_DISPATCH__)"))
             #expect(script.contains("window.__ADA_BRIDGE_DISPATCH__(`"))
@@ -883,7 +916,11 @@ extension AdaBridgeHandlerTests {
         func `command dict is serialised as JSON inside the script`() throws {
             let handler = makeHandler()
             let webView = ScriptCapturingWebView()
-            handler.dispatchCommand(["type": "ada.deleteHistory"], to: webView)
+            handler.dispatchCommand(
+                ["type": "ada.deleteHistory"],
+                to: webView,
+                ticket: handler.captureDocumentTicket(for: webView),
+            )
             let script = try #require(webView.capturedScripts.first)
             #expect(script.contains("ada.deleteHistory"))
         }
@@ -892,7 +929,11 @@ extension AdaBridgeHandlerTests {
         func `backtick in value is escaped to prevent template-literal injection`() throws {
             let handler = makeHandler()
             let webView = ScriptCapturingWebView()
-            handler.dispatchCommand(["type": "ada.setLanguage", "payload": ["language": "fr`x"]], to: webView)
+            handler.dispatchCommand(
+                ["type": "ada.setLanguage", "payload": ["language": "fr`x"]],
+                to: webView,
+                ticket: handler.captureDocumentTicket(for: webView),
+            )
             let script = try #require(webView.capturedScripts.first)
             #expect(script.contains("\\`"))
         }
@@ -901,7 +942,11 @@ extension AdaBridgeHandlerTests {
         func `dollar-brace in value is escaped to prevent template expression injection`() throws {
             let handler = makeHandler()
             let webView = ScriptCapturingWebView()
-            handler.dispatchCommand(["type": "ada.setLanguage", "payload": ["language": "${evil}"]], to: webView)
+            handler.dispatchCommand(
+                ["type": "ada.setLanguage", "payload": ["language": "${evil}"]],
+                to: webView,
+                ticket: handler.captureDocumentTicket(for: webView),
+            )
             let script = try #require(webView.capturedScripts.first)
             #expect(script.contains("\\${"))
         }
@@ -977,8 +1022,7 @@ enum AdaWebHostBridgeRuntimeTests {
     @Test
     static func `bridge runtime queues commands until sdk ready`() throws {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = false
 
         host.setLanguage(language: "fr")
@@ -995,8 +1039,7 @@ enum AdaWebHostBridgeRuntimeTests {
     @Test
     static func `bridge runtime sends device token only once after a pre-ready update`() {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = false
 
         host.setDeviceToken(deviceToken: "abc123")
@@ -1015,8 +1058,7 @@ enum AdaWebHostBridgeRuntimeTests {
     @Test
     static func `bridge runtime forwards an explicit resetChatHistory false`() throws {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = true
 
         host.reset(resetChatHistory: false)
@@ -1031,8 +1073,7 @@ enum AdaWebHostBridgeRuntimeTests {
     @Test
     static func `bridge runtime omits the resetChatHistory key for an explicit nil`() throws {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = true
 
         host.reset(resetChatHistory: nil)
@@ -1045,8 +1086,7 @@ enum AdaWebHostBridgeRuntimeTests {
     @Test
     static func `bridge runtime defaults resetChatHistory to an explicit true`() throws {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = true
 
         host.reset()
@@ -1067,8 +1107,7 @@ enum AdaWebHostBridgeRuntimeTests {
             environment: .production,
             webSdk: .messaging,
         )
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = false
 
         host.adaBridgeDidBecomeReady(AdaBridgeHandler())
@@ -1082,8 +1121,7 @@ enum AdaWebHostBridgeRuntimeTests {
     @Test
     static func `bridge runtime sends no sensitive meta fields command when none were given`() {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = false
 
         host.adaBridgeDidBecomeReady(AdaBridgeHandler())
@@ -1306,11 +1344,27 @@ enum AdaWebHostBridgeRuntimeTests {
 
 @MainActor
 enum AdaWebHostLegacyCommandQueueTests {
+    /// The legacy page the host actually loads, which is the document its commands are
+    /// scoped to — `registerLegacySessionMirror` pins the same value in production.
+    private static func legacyHost() -> (AdaWebHost, ScriptCapturingWebView) {
+        // The page `legacyMobileSdkWebviewUrl()` builds for this handle with no cluster or
+        // domain override, which `registerLegacySessionMirror` pins as the trusted origin.
+        let pageUrl = URL(string: "https://ada-example.ada.support/mobile-sdk-webview/")
+        let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .legacy)
+        host.bridgeHandler.trustedOrigin = pageUrl.flatMap { AdaWebHost.pageOrigin(ofUrl: $0.absoluteString) }
+        host.bridgeHandler.trustedDocumentUrl = pageUrl?.absoluteString
+        let webView = ScriptCapturingWebView(documentUrl: pageUrl)
+        host.webView = webView
+        return (host, webView)
+    }
+
+    private static func sensitiveFieldBuilder() -> MetaFields.Builder {
+        MetaFields.Builder().setField(key: "ssn", value: "000-00-0000")
+    }
+
     @Test
     static func `legacy runtime queues commands until the host page is ready`() {
-        let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .legacy)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let (host, webView) = legacyHost()
         host.webHostLoaded = false
 
         host.setLanguage(language: "fr")
@@ -1320,6 +1374,60 @@ enum AdaWebHostLegacyCommandQueueTests {
         host.webHostLoaded = true
 
         #expect(webView.capturedScripts.contains(where: { $0.contains("adaEmbed.setLanguage") && $0.contains("fr") }))
+    }
+
+    /// Queuing defers the target document from call time to replay time, and `webHostLoaded`
+    /// is a latch no later top-level navigation clears — so the flush has to re-check the live
+    /// main document rather than trust readiness. `setSensitiveMetaFields` travels this queue.
+    @Test
+    static func `legacy runtime drops a queued command when another document took the frame`() {
+        let (host, webView) = legacyHost()
+        host.webHostLoaded = false
+
+        host.setLanguage(language: "fr")
+        webView.documentUrl = URL(string: "https://oppositesnakes.com/")
+        host.webHostLoaded = true
+
+        #expect(webView.capturedScripts.isEmpty)
+    }
+
+    /// The replacement an attacker can actually reach is SAME-ORIGIN: the bot's own host serves
+    /// the rest of the customer's site, and the build-version parameters the legacy page reads
+    /// ride its query. An origin comparison passes every one of these, so the queued
+    /// `setSensitiveMetaFields` would execute in a page carrying parameters an attacker chose.
+    @Test(
+        "legacy runtime drops a queued command when a same-origin page replaced the host page",
+        arguments: [
+            "https://ada-example.ada.support/",
+            "https://ada-example.ada.support/mobile-sdk-webview/?__ada-embed-version=attacker-build",
+            "https://ada-example.ada.support/mobile-sdk-webview/index.html",
+        ],
+    )
+    static func legacyRuntimeDropsQueuedCommandOnSameOriginReplacement(url: String) {
+        let (host, webView) = legacyHost()
+        host.webHostLoaded = false
+
+        host.setSensitiveMetaFields(builder: sensitiveFieldBuilder())
+        webView.documentUrl = URL(string: url)
+        host.webHostLoaded = true
+
+        #expect(webView.capturedScripts.isEmpty)
+    }
+
+    /// A command issued while a same-origin replacement already holds the frame is refused too —
+    /// readiness survives an in-place navigation, so nothing queues and the guard is the only gate.
+    @Test
+    static func `legacy runtime drops a live command issued into a same-origin replacement`() {
+        let (host, webView) = legacyHost()
+        host.webHostLoaded = true
+        // Readiness injects the legacy bootstrap into the real page, which is legitimate and
+        // stays captured — so the assertion is on the command, not on the buffer being empty.
+        #expect(webView.capturedScripts.contains(where: { $0.contains("adaEmbed.start") }))
+
+        webView.documentUrl = URL(string: "https://ada-example.ada.support/mobile-sdk-webview/?__ada-chat-version=x")
+        host.setSensitiveMetaFields(builder: sensitiveFieldBuilder())
+
+        #expect(!webView.capturedScripts.contains(where: { $0.contains("setSensitiveMetaFields") }))
     }
 }
 
@@ -1388,10 +1496,18 @@ enum AdaWebViewConfigScriptTests {
         try configScriptParts(from: script).payload
     }
 
+    /// Even with no token and no appUrl, a Messaging host still emits a
+    /// capability-only script so the CDN web runtime learns this native version
+    /// supports the session mirror (EXP-1082).
     @Test
-    static func `returns nil when there is nothing to send`() {
+    static func `emits a capability-only script when there is no token or app url`() throws {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
-        #expect(host.makeWebviewConfigScript() == nil)
+        let script = try #require(host.makeWebviewConfigScript())
+        let payload = try configPayload(from: script)
+
+        #expect(payload["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(payload["identityToken"] == nil)
+        #expect(payload["appUrl"] == nil)
     }
 
     @Test
@@ -1559,14 +1675,18 @@ enum AdaWebViewConfigScriptTests {
     }
 
     @Test
-    static func `treats a whitespace-only token as absent`() {
+    static func `treats a whitespace-only token as absent`() throws {
         let host = AdaWebHost(
             handle: "ada-example",
             environment: .production,
             webSdk: .messaging,
             identityToken: "   ",
         )
-        #expect(host.makeWebviewConfigScript() == nil)
+        let script = try #require(host.makeWebviewConfigScript())
+        let payload = try configPayload(from: script)
+
+        #expect(payload["identityToken"] == nil)
+        #expect(payload["nativeSessionMirrorSupported"] as? Bool == true)
     }
 
     /// A token holding JS-hostile characters must survive as data, not become code.
@@ -1613,8 +1733,11 @@ enum AdaWebViewConfigScriptTests {
         #expect(retained["appUrl"] as? String == "https://apps.example.com/custom-app/index.html")
     }
 
+    /// A token-only config withholds the credential from a later document but
+    /// still re-advertises the mirror capability, so the retained payload carries
+    /// only `nativeSessionMirrorSupported` — no token, injectionId, or appUrl.
     @Test
-    static func `retained payload is empty for a token-only config`() throws {
+    static func `retained payload keeps only the capability for a token-only config`() throws {
         let host = AdaWebHost(
             handle: "ada-example",
             environment: .production,
@@ -1625,7 +1748,10 @@ enum AdaWebViewConfigScriptTests {
         let script = try #require(host.makeWebviewConfigScript())
         let retained = try #require(configScriptParts(from: script).retained)
 
-        #expect(retained.isEmpty)
+        #expect(retained["identityToken"] == nil)
+        #expect(retained["injectionId"] == nil)
+        #expect(retained["appUrl"] == nil)
+        #expect(retained["nativeSessionMirrorSupported"] as? Bool == true)
     }
 
     /// appUrl is plain config every document (re-)mount needs, so an appUrl-only
@@ -1731,6 +1857,20 @@ enum AdaWebViewConfigScriptExecutionTests {
         )
     }
 
+    /// The SDK gate arms the mirror only on `nativeSessionMirrorSupported === true`,
+    /// a strict boolean compare — so the value delivered to `window` must be a real
+    /// JSON boolean, not the string `"true"`. Round-tripping it back as `Bool`
+    /// (never `String`) pins that.
+    @Test
+    static func `advertises native session mirror support as a real boolean`() throws {
+        let script = try #require(makeHost().makeWebviewConfigScript())
+
+        let config = try #require(try runConfigScript(script, origin: trustedOrigin))
+
+        #expect(config["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(config["nativeSessionMirrorSupported"] as? String == nil)
+    }
+
     @Test
     static func `withholds the consumed token from a later document but keeps appUrl`() throws {
         let script = try #require(makeHost().makeWebviewConfigScript())
@@ -1743,6 +1883,7 @@ enum AdaWebViewConfigScriptExecutionTests {
 
         #expect(config["identityToken"] == nil)
         #expect(config["appUrl"] as? String == "https://apps.example.com/custom-app/index.html")
+        #expect(config["nativeSessionMirrorSupported"] as? Bool == true)
     }
 
     @Test
@@ -1839,8 +1980,7 @@ enum AdaWebHostSendMessageTests {
             webSdk: .messaging,
             enableProgrammaticControl: true,
         )
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = false
 
         host.sendMessage("I need help with my order")
@@ -1857,8 +1997,7 @@ enum AdaWebHostSendMessageTests {
     @Test
     static func `bridge runtime dispatches sendMessage immediately when ready`() throws {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = true
 
         host.sendMessage("hello")
@@ -1873,8 +2012,7 @@ enum AdaWebHostSendMessageTests {
     @Test
     static func `legacy remote host page drops sendMessage`() {
         let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .legacy)
-        let webView = ScriptCapturingWebView()
-        host.webView = webView
+        let webView = ScriptCapturingWebView.mounted(on: host)
         host.webHostLoaded = true
 
         host.sendMessage("hello")
@@ -2515,21 +2653,26 @@ enum AdaErrorInterceptorScriptTests {
 @MainActor
 enum AdaWebHostConsumedIdentityTokenTests {
     /// A rebuilt WebView has fresh sessionStorage, so the in-script consumed-marker
-    /// guard cannot withhold a spent token there — the native memo must.
+    /// guard cannot withhold a spent token there — the native memo must. The
+    /// capability-only script still arms (the mirror handshake outlives the
+    /// one-shot token), so the guarantee is that the spent token never reappears.
     @Test
-    static func `a spent token never re-arms the config script`() {
+    static func `a spent token is never re-injected while the capability script stays armed`() throws {
         let host = AdaWebHost(
             handle: "ada-example",
             environment: .production,
             webSdk: .messaging,
             identityToken: "secret-jwt-token",
         )
-        #expect(host.makeWebviewConfigScript() != nil)
+        let armed = try #require(host.makeWebviewConfigScript())
+        #expect(armed.source.contains("secret-jwt-token"))
 
         host.adaBridgeDidBecomeReady(host.bridgeHandler)
 
         #expect(host.consumedIdentityToken == "secret-jwt-token")
-        #expect(host.makeWebviewConfigScript() == nil)
+        let reArmed = try #require(host.makeWebviewConfigScript())
+        #expect(!reArmed.source.contains("secret-jwt-token"))
+        #expect(reArmed.source.contains("nativeSessionMirrorSupported"))
     }
 
     /// Flagging a consumed (no longer armed) token would make the runtime report
@@ -2581,7 +2724,8 @@ enum AdaWebHostConsumedIdentityTokenTests {
             identityToken: "old-jwt-token",
         )
         host.adaBridgeDidBecomeReady(host.bridgeHandler)
-        #expect(host.makeWebviewConfigScript() == nil)
+        let afterConsumed = try #require(host.makeWebviewConfigScript())
+        #expect(!afterConsumed.source.contains("old-jwt-token"))
 
         host.identityToken = "new-jwt-token"
 
@@ -2688,6 +2832,26 @@ enum AdaWebHostClearPersistedStateTests {
         #expect(host.bridgeHandler.makeInitialStateScript() != nil)
 
         host.clearPersistedState()
+
+        #expect(host.bridgeHandler.makeInitialStateScript() == nil)
+    }
+
+    /// The durable variant wipes the same branding cache as ``clearPersistedState()``,
+    /// and additionally returns whether the Keychain mirror wipe is confirmed so a
+    /// caller can retry a failed sign-out. Kept separate so ``clearPersistedState()``
+    /// keeps its `Void` binary contract for prebuilt-XCFramework consumers.
+    /// ``AdaWebHost`` builds its own bridge handler over the real Keychain, so only
+    /// the branding-cache half is deterministic from here.
+    @Test
+    static func `durable clear also wipes the branding state cache`() {
+        let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .messaging)
+        host.bridgeHandler.handleBridgeMessage([
+            "type": "sdk.state.cache",
+            "state": ["chatEnabled": true],
+        ])
+        #expect(host.bridgeHandler.makeInitialStateScript() != nil)
+
+        host.clearPersistedStateDurably()
 
         #expect(host.bridgeHandler.makeInitialStateScript() == nil)
     }
