@@ -222,7 +222,18 @@ public class AdaWebHost: NSObject {
     /// The armed `window.__ADA_WEBVIEW_CONFIG__` document-start script, kept so
     /// `disarmWebviewConfigScript()` can remove exactly it — and nothing else —
     /// once the runtime reports ready and the one-shot identity token is spent.
+    /// Note this is non-nil even for a token-less config (sensitiveMetaFields /
+    /// appUrl / mirror flag) and after the retained-only re-arm, so it does NOT
+    /// mean "the identity token is armed" — use `armedIdentityToken` for that.
     var webviewConfigUserScript: WKUserScript?
+
+    /// The identity token actually injected into the current document, or nil when
+    /// the armed script carries no token (token-less config, or a spent token). This
+    /// is the sole signal that the one-shot token reached a document, kept separate
+    /// from `webviewConfigUserScript` because the post-ready retained re-arm leaves
+    /// that non-nil without ever re-injecting the token — reading it as "token armed"
+    /// would let a fresh, never-delivered token be memoed as consumed.
+    var armedIdentityToken: String?
 
     /// The identity token the runtime consumed (single-use — an exchange attempt
     /// spends it even when it fails downstream). A WebView rebuild re-arms the
@@ -259,6 +270,11 @@ public class AdaWebHost: NSObject {
     /// Commands queued while the SDK is not yet ready, flushed once sdk.ready fires.
     var pendingCommands = [() -> Void]()
 
+    /// Count of curated bridge requests still in the PRE-dispatch (queued) phase, used to
+    /// bound the pre-ready queue at registration (see `performBridgeRequest`). Mutated only on
+    /// the main queue. `AdaBridgeHandler.maxPendingBridgeRequests` caps the post-dispatch map.
+    var queuedBridgeRequestCount = 0
+
     /// Bridge handler for state caching and injection-safe command dispatch.
     let bridgeHandler = AdaBridgeHandler()
 
@@ -286,6 +302,20 @@ public class AdaWebHost: NSObject {
             return explicitCluster
         }
         return environment?.webviewCluster ?? ""
+    }
+
+    /// The reserved metafields the web UI reads to recognize the official iOS host:
+    /// `sdkType` (embed-2 derives `device_os` from it and the chat keys native
+    /// affordances off it) and the native transcript-download capability. Applied on
+    /// init and re-applied on every legacy reset — embed-2 replaces its stored
+    /// metaFields with the reset payload's, so a reset that omits them would drop
+    /// `sdkType` and a later `setDeviceToken` would derive `device_os` "WEB". The
+    /// reserved values win over any caller value.
+    static func withReservedMetaFields(_ metaFields: [String: Any]?) -> [String: Any] {
+        (metaFields ?? [:]).merging([
+            "sdkType": "IOS",
+            "sdkSupportsDownloadLink": true,
+        ]) { _, reserved in reserved }
     }
 
     public init(
@@ -321,10 +351,7 @@ public class AdaWebHost: NSObject {
         self.styles = styles
         self.domain = domain
         self.greeting = greeting
-        self.metafields = metafields
-//        we always want to append the sdkType
-        self.metafields["sdkType"] = "IOS"
-        self.metafields["sdkSupportsDownloadLink"] = true
+        self.metafields = AdaWebHost.withReservedMetaFields(metafields)
         self.sensitiveMetafields = sensitiveMetafields
         self.openWebLinksInSafari = openWebLinksInSafari
         self.appScheme = appScheme

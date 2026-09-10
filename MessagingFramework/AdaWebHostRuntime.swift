@@ -153,7 +153,17 @@ extension AdaWebHost {
             let languageJson = jsonStr(language)
             let stylesJson = jsonStr(styles)
             let greetingJson = jsonStr(greeting)
+            // A whitespace-only token must never seed a bogus device_token/device_os binding
+            // on the first chatter: a blank string is falsy so embed-2 skips it, but a
+            // whitespace-only token is truthy and would fold through. Mirror Android's
+            // isNotBlank gate and RN's isNonBlankToken — emit the init-time deviceToken start
+            // option and the post-ready setter call only for a non-blank token. (EXP-1223)
             let deviceTokenJson = jsonStr(deviceToken)
+            let hasDeviceToken =
+                !deviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let deviceTokenStartOption = hasDeviceToken ? "deviceToken: \(deviceTokenJson)," : ""
+            let deviceTokenSetterCall =
+                hasDeviceToken ? "adaEmbed.setDeviceToken(\(deviceTokenJson));" : ""
 
             let startBody = """
                 window.adaEmbed.start({
@@ -166,9 +176,16 @@ extension AdaWebHost {
                     metaFields: \(metaFieldsJson),
                     hostTelemetry: \(hostTelemetryJson),
                     sensitiveMetaFields: \(sensitiveMetaFieldsJson),
+                    \(deviceTokenStartOption)
                     parentElement: "parent-element",
                     onAdaEmbedLoaded: () => {
-                        adaEmbed.setDeviceToken(\(deviceTokenJson));
+                        // Init-time deviceToken (above) pre-populates the device_token/
+                        // device_os chatter variables on the FIRST chatter via embed-2's
+                        // StartOptions.deviceToken (EXP-1223). Actual push registration
+                        // still happens here: this setter's post-ready data_storage write
+                        // is what binds the device, and it is also the N-1 fallback for an
+                        // embed-2 build too old to read the start option.
+                        \(deviceTokenSetterCall)
                         adaEmbed.subscribeEvent("ada:chat_frame_timeout", (data, context) => {
                             window.webkit.messageHandlers
                                 .chatFrameTimeoutCallbackHandler
@@ -282,10 +299,13 @@ extension AdaWebHost: AdaBridgeDelegate {
         // The mount consumed the one-shot identityToken (or the in-script guard
         // withheld it); memo the spent token so a WebView rebuild never re-arms
         // it, then remove the document-start registration so no later document
-        // can replay the spent credential.
-        let trimmedIdentityToken = identityToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedIdentityToken.isEmpty, webviewConfigUserScript != nil {
-            consumedIdentityToken = trimmedIdentityToken
+        // can replay the spent credential. Key the memo on the token actually armed
+        // into this document (`armedIdentityToken`), not on `webviewConfigUserScript`:
+        // the retained-only re-arm leaves that non-nil without a token, so reading it
+        // here would memo a fresh, never-injected token as consumed and strand an
+        // identified session as anonymous after an in-place reload.
+        if let armed = armedIdentityToken, !armed.isEmpty {
+            consumedIdentityToken = armed
         }
         disarmWebviewConfigScript()
         webHostLoaded = true

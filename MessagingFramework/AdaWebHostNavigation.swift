@@ -301,6 +301,21 @@ enum AdaNavigationPolicy: Equatable {
 // MARK: - WKNavigationDelegate & WKUIDelegate
 
 extension AdaWebHost: WKNavigationDelegate, WKUIDelegate {
+    public func webView(_: WKWebView, didCommit _: WKNavigation!) {
+        // `didCommit` is the callback immediately before WebKit swaps in the new
+        // main-frame document, so it is the first point the document any outstanding
+        // curated requests (EXP-1225) were issued into is provably being replaced —
+        // their `sdk.response` can never arrive. Fail them now rather than stranding
+        // the host to the 35s timeout, matching Android's `cancelPendingBridgeRequests`
+        // on rebind and React Native's `rejectAllPendingBridgeRequests` on remount.
+        // Cancelling at `didStartProvisionalNavigation` instead would fire before the
+        // swap is confirmed, so a provisional navigation that then fails
+        // (`didFailProvisionalNavigation`) would spuriously reject requests the
+        // still-live previous document could have answered. On the first load nothing
+        // is pending, so this is a no-op; teardown still cancels separately.
+        bridgeHandler.cancelPendingBridgeRequests(reason: "Ada runtime document was replaced")
+    }
+
     public func webView(_ webView: WKWebView, didFinish _: WKNavigation!) {
         let url = webView.url?.absoluteString ?? ""
         let event: [String: Any] = ["event_name": "ada.webview.loaded", "url": url]
@@ -322,8 +337,17 @@ extension AdaWebHost: WKNavigationDelegate, WKUIDelegate {
         let httpSchemes = ["http", "https"]
         let urlScheme = url.scheme
         // Handle opening universal links within the host App
-        // This requires the appScheme argument to work
-        if urlScheme == appScheme {
+        // This requires the appScheme argument to work. Tolerate the URL-shaped form
+        // ("myapp://" or "myapp:") and case: url.scheme is the bare, lowercased scheme, so a
+        // trailing separator or capitalization on the host-supplied appScheme would otherwise
+        // silently never match and the deep link would fall through to the origin refusal.
+        var normalizedAppScheme = appScheme.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalizedAppScheme.hasSuffix("://") {
+            normalizedAppScheme = String(normalizedAppScheme.dropLast(3))
+        } else if normalizedAppScheme.hasSuffix(":") {
+            normalizedAppScheme = String(normalizedAppScheme.dropLast())
+        }
+        if let scheme = urlScheme, !normalizedAppScheme.isEmpty, scheme.lowercased() == normalizedAppScheme {
             guard let presentingVC = findViewController(from: webView) else { return }
             presentingVC.dismiss(animated: true) {
                 let shared = UIApplication.shared

@@ -4,7 +4,7 @@ import WebKit
 // MARK: - Commands
 
 public extension AdaWebHost {
-    private func dispatchBridgeCommandWhenReady(_ action: @escaping (WKWebView) -> Void) {
+    internal func dispatchBridgeCommandWhenReady(_ action: @escaping (WKWebView) -> Void) {
         if webHostLoaded, let webView {
             action(webView)
             return
@@ -19,6 +19,11 @@ public extension AdaWebHost {
     }
 
     func setDeviceToken(deviceToken: String) {
+        // A whitespace-only token must never win or clear an existing registration
+        // (mirrors RN's isNonBlankToken and Android's isNotBlank). Delivery is gated on
+        // a non-empty token, so a blank call before the runtime is ready would otherwise
+        // overwrite the retained token and permanently discard the init-time push token. (EXP-1223)
+        guard !deviceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         self.deviceToken = deviceToken
         if usesBridgeRuntime {
             // Before the bridge runtime is ready, keep only the latest token in
@@ -57,6 +62,15 @@ public extension AdaWebHost {
         renamed: "setSensitiveMetaFields(builder:)"
     )
     func setSensitiveMetaFields(_ fields: [String: Any]) {
+        // MERGE into the backing field, matching the web runtime's
+        // SET_SENSITIVE_META_FIELDS handler (`{ ...existing, ...payload }`), so the
+        // post-ready re-send on a later document (adaBridgeDidBecomeReady) reflects
+        // the session's full credential set — a partial update must not drop keys a
+        // prior call set (EXP-1223).
+        self.sensitiveMetafields.merge(fields) { _, new in new }
+        // Rebuild the armed document-start re-arm so a later document carries this
+        // updated credential, not the value armed at the last sdk.ready (EXP-1223 grJTI).
+        refreshRetainedConfigScriptIfArmed()
         if usesBridgeRuntime {
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.setSensitiveMetaFields(fields, to: webView)
@@ -84,6 +98,9 @@ public extension AdaWebHost {
 
     func setSensitiveMetaFields(builder: MetaFields.Builder) {
         let metaFields = builder.build().metaFields
+        // Merge into the backing field (see the string overload).
+        self.sensitiveMetafields.merge(metaFields) { _, new in new }
+        refreshRetainedConfigScriptIfArmed()
         if usesBridgeRuntime {
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.setSensitiveMetaFields(metaFields, to: webView)
@@ -110,12 +127,20 @@ public extension AdaWebHost {
         sensitiveMetaFields: [String: Any]? = nil,
         resetChatHistory: Bool? = true,
     ) {
+        // A reset REPLACES the session's sensitive fields with the reset's value —
+        // matching the web RESET handler (`newState.sensitiveMetaFields = payload`),
+        // where an omitted value clears them. So the backing field the post-ready
+        // re-send reads must track that: the reset's fields, or empty when none are
+        // passed. Otherwise a later document resurrects a credential the reset
+        // cleared (EXP-1223).
+        self.sensitiveMetafields = sensitiveMetaFields ?? [:]
+        refreshRetainedConfigScriptIfArmed()
         if usesBridgeRuntime {
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.reset(
                     language: language,
                     greeting: greeting,
-                    metaFields: metaFields,
+                    metaFields: metaFields.map { AdaWebHost.withReservedMetaFields($0) },
                     sensitiveMetaFields: sensitiveMetaFields,
                     resetChatHistory: resetChatHistory,
                     to: webView,
@@ -126,7 +151,7 @@ public extension AdaWebHost {
         let data: [String: Any?] = [
             "language": language,
             "greeting": greeting,
-            "metaFields": metaFields,
+            "metaFields": AdaWebHost.withReservedMetaFields(metaFields),
             "sensitiveMetaFields": sensitiveMetaFields,
             "resetChatHistory": resetChatHistory,
         ]
@@ -141,12 +166,16 @@ public extension AdaWebHost {
         metaFields: MetaFields.Builder,
         resetChatHistory: Bool? = true,
     ) {
+        // This reset carries no sensitive fields, so the web clears them — the
+        // backing field the post-ready re-send reads must clear too (EXP-1223).
+        self.sensitiveMetafields = [:]
+        refreshRetainedConfigScriptIfArmed()
         if usesBridgeRuntime {
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.reset(
                     language: language,
                     greeting: greeting,
-                    metaFields: metaFields.build().metaFields,
+                    metaFields: AdaWebHost.withReservedMetaFields(metaFields.build().metaFields),
                     sensitiveMetaFields: nil,
                     resetChatHistory: resetChatHistory,
                     to: webView,
@@ -157,7 +186,7 @@ public extension AdaWebHost {
         let data: [String: Any?] = [
             "language": language,
             "greeting": greeting,
-            "metaFields": metaFields.build().metaFields,
+            "metaFields": AdaWebHost.withReservedMetaFields(metaFields.build().metaFields),
             "sensitiveMetaFields": nil,
             "resetChatHistory": resetChatHistory,
         ]
@@ -172,13 +201,18 @@ public extension AdaWebHost {
         sensitiveMetaFields: MetaFields.Builder,
         resetChatHistory: Bool? = true,
     ) {
+        let resolvedSensitiveMetaFields = sensitiveMetaFields.build().metaFields
+        // The retained-injection backing field tracks the reset's sensitive fields
+        // so a later document re-arms with them (EXP-1223).
+        self.sensitiveMetafields = resolvedSensitiveMetaFields
+        refreshRetainedConfigScriptIfArmed()
         if usesBridgeRuntime {
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.reset(
                     language: language,
                     greeting: greeting,
                     metaFields: nil,
-                    sensitiveMetaFields: sensitiveMetaFields.build().metaFields,
+                    sensitiveMetaFields: resolvedSensitiveMetaFields,
                     resetChatHistory: resetChatHistory,
                     to: webView,
                 )
@@ -188,8 +222,8 @@ public extension AdaWebHost {
         let data: [String: Any?] = [
             "language": language,
             "greeting": greeting,
-            "metaFields": nil,
-            "sensitiveMetaFields": sensitiveMetaFields.build().metaFields,
+            "metaFields": AdaWebHost.withReservedMetaFields(nil),
+            "sensitiveMetaFields": resolvedSensitiveMetaFields,
             "resetChatHistory": resetChatHistory,
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: data, options: .fragmentsAllowed),
@@ -204,13 +238,18 @@ public extension AdaWebHost {
         sensitiveMetaFields: MetaFields.Builder,
         resetChatHistory: Bool? = true,
     ) {
+        let resolvedSensitiveMetaFields = sensitiveMetaFields.build().metaFields
+        // The retained-injection backing field tracks the reset's sensitive fields
+        // so a later document re-arms with them (EXP-1223).
+        self.sensitiveMetafields = resolvedSensitiveMetaFields
+        refreshRetainedConfigScriptIfArmed()
         if usesBridgeRuntime {
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.reset(
                     language: language,
                     greeting: greeting,
-                    metaFields: metaFields.build().metaFields,
-                    sensitiveMetaFields: sensitiveMetaFields.build().metaFields,
+                    metaFields: AdaWebHost.withReservedMetaFields(metaFields.build().metaFields),
+                    sensitiveMetaFields: resolvedSensitiveMetaFields,
                     resetChatHistory: resetChatHistory,
                     to: webView,
                 )
@@ -220,8 +259,8 @@ public extension AdaWebHost {
         let data: [String: Any?] = [
             "language": language,
             "greeting": greeting,
-            "metaFields": metaFields.build().metaFields,
-            "sensitiveMetaFields": sensitiveMetaFields.build().metaFields,
+            "metaFields": AdaWebHost.withReservedMetaFields(metaFields.build().metaFields),
+            "sensitiveMetaFields": resolvedSensitiveMetaFields,
             "resetChatHistory": resetChatHistory,
         ]
         guard let json = try? JSONSerialization.data(withJSONObject: data, options: .fragmentsAllowed),
@@ -230,6 +269,10 @@ public extension AdaWebHost {
     }
 
     func reset(language: String? = nil, greeting: String? = nil, resetChatHistory: Bool? = true) {
+        // No sensitive fields, so the web clears them — clear the backing field the
+        // post-ready re-send reads (EXP-1223).
+        self.sensitiveMetafields = [:]
+        refreshRetainedConfigScriptIfArmed()
         if usesBridgeRuntime {
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.reset(
@@ -244,7 +287,7 @@ public extension AdaWebHost {
         let data: [String: Any?] = [
             "language": language,
             "greeting": greeting,
-            "metaFields": nil,
+            "metaFields": AdaWebHost.withReservedMetaFields(nil),
             "sensitiveMetaFields": nil,
             "resetChatHistory": resetChatHistory,
         ]

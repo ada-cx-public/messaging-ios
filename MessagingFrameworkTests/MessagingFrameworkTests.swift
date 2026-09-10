@@ -589,7 +589,9 @@ final class ScriptCapturingWebView: WKWebView {
     var capturedScripts: [String] = []
     var documentUrl: URL?
 
-    override var url: URL? { documentUrl }
+    override var url: URL? {
+        documentUrl
+    }
 
     init(documentUrl: URL? = URL(string: "https://messaging-assets.ada.support/sdk/webview.html")) {
         self.documentUrl = documentUrl
@@ -1376,6 +1378,50 @@ enum AdaWebHostLegacyCommandQueueTests {
         #expect(webView.capturedScripts.contains(where: { $0.contains("adaEmbed.setLanguage") && $0.contains("fr") }))
     }
 
+    /// EXP-1224: every legacy reset overload must re-stamp the reserved iOS metafields.
+    /// embed-2 replaces its stored metaFields with the reset payload's, so a reset that
+    /// omits them drops `sdkType` and a later `setDeviceToken` derives `device_os` "WEB",
+    /// stopping push after any reset. The zero-metaFields overload is the one `reset()`
+    /// resolves to, and the Builder overload is the recommended replacement — both go
+    /// through the legacy `adaEmbed.reset(...)` path here.
+    @Test
+    static func `legacy reset re-stamps the reserved iOS metafields on the no-metafields overload`() throws {
+        let (host, webView) = legacyHost()
+        host.webHostLoaded = true
+
+        host.reset(resetChatHistory: true)
+
+        let script = try #require(
+            webView.capturedScripts.last(where: { $0.contains("adaEmbed.reset") })
+        )
+        #expect(script.contains("\"sdkType\":\"IOS\""))
+        #expect(script.contains("\"sdkSupportsDownloadLink\":true"))
+    }
+
+    @Test
+    static func `legacy reset re-stamps the reserved iOS metafields on the builder overload`() throws {
+        let (host, webView) = legacyHost()
+        host.webHostLoaded = true
+
+        host.reset(metaFields: MetaFields.Builder(), sensitiveMetaFields: MetaFields.Builder())
+
+        let script = try #require(
+            webView.capturedScripts.last(where: { $0.contains("adaEmbed.reset") })
+        )
+        #expect(script.contains("\"sdkType\":\"IOS\""))
+        #expect(script.contains("\"sdkSupportsDownloadLink\":true"))
+    }
+
+    /// The reserved identity is applied and wins over any caller value, so a host cannot
+    /// spoof the platform and `device_os` derives "IOS".
+    @Test
+    static func `withReservedMetaFields applies and overrides the reserved iOS identity`() {
+        let merged = AdaWebHost.withReservedMetaFields(["tier": "gold", "sdkType": "CUSTOM"])
+        #expect(merged["sdkType"] as? String == "IOS")
+        #expect(merged["sdkSupportsDownloadLink"] as? Bool == true)
+        #expect(merged["tier"] as? String == "gold")
+    }
+
     /// Queuing defers the target document from call time to replay time, and `webHostLoaded`
     /// is a latch no later top-level navigation clears — so the flush has to re-check the live
     /// main document rather than trust readiness. `setSensitiveMetaFields` travels this queue.
@@ -1396,14 +1442,13 @@ enum AdaWebHostLegacyCommandQueueTests {
     /// ride its query. An origin comparison passes every one of these, so the queued
     /// `setSensitiveMetaFields` would execute in a page carrying parameters an attacker chose.
     @Test(
-        "legacy runtime drops a queued command when a same-origin page replaced the host page",
         arguments: [
             "https://ada-example.ada.support/",
             "https://ada-example.ada.support/mobile-sdk-webview/?__ada-embed-version=attacker-build",
             "https://ada-example.ada.support/mobile-sdk-webview/index.html",
         ],
     )
-    static func legacyRuntimeDropsQueuedCommandOnSameOriginReplacement(url: String) {
+    static func `legacy runtime drops a queued command when a same-origin page replaced the host page`(url: String) {
         let (host, webView) = legacyHost()
         host.webHostLoaded = false
 
@@ -1432,67 +1477,243 @@ enum AdaWebHostLegacyCommandQueueTests {
 }
 
 @MainActor
+enum AdaWebHostLegacyStartConfigTests {
+    /// The legacy `adaEmbed.start(...)` payload the host injects once the remote page reports
+    /// ready. Mirrors `AdaWebHostLegacyCommandQueueTests.legacyHost` but carries init-time
+    /// sensitive meta-fields and a device token so their presence in the payload is observable.
+    private static func startBody(
+        sensitiveMetafields: [String: Any],
+        deviceToken: String,
+    ) -> String? {
+        let pageUrl = URL(string: "https://ada-example.ada.support/mobile-sdk-webview/")
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: sensitiveMetafields,
+            deviceToken: deviceToken,
+            environment: .production,
+            webSdk: .legacy,
+        )
+        host.bridgeHandler.trustedOrigin = pageUrl.flatMap { AdaWebHost.pageOrigin(ofUrl: $0.absoluteString) }
+        host.bridgeHandler.trustedDocumentUrl = pageUrl?.absoluteString
+        let webView = ScriptCapturingWebView(documentUrl: pageUrl)
+        host.webView = webView
+        host.webHostLoaded = true
+        return webView.capturedScripts.first { $0.contains("adaEmbed.start") }
+    }
+
+    /// iOS legacy has always forwarded sensitiveMetaFields at init through the start payload
+    /// (EXP-1223); this pins it so a refactor cannot silently drop it and diverge from Android
+    /// and the Messaging bridge path.
+    @Test
+    static func `legacy start config forwards init-time sensitive meta fields`() throws {
+        let body = try #require(
+            startBody(sensitiveMetafields: ["authToken": "sensitive-value"], deviceToken: ""),
+        )
+        #expect(body.contains("sensitiveMetaFields"))
+        #expect(body.contains("authToken"))
+        #expect(body.contains("sensitive-value"))
+    }
+
+    /// The device token rides two distinct paths: init-time inside the `adaEmbed.start(...)`
+    /// object literal (EXP-1223), and the post-ready `setDeviceToken` setter as the N-1 fallback.
+    /// Assert each separately — a token-bearing `setDeviceToken(...)` call alone would satisfy a
+    /// bare `contains("device-abc123")`, so dropping the init-time line must fail this test.
+    @Test
+    static func `legacy start config forwards the device token at init`() throws {
+        let body = try #require(startBody(sensitiveMetafields: [:], deviceToken: "device-abc123"))
+
+        // The setter lives in `onAdaEmbedLoaded`; slice ahead of it to isolate the start config's
+        // own init-time `deviceToken:` field, which the setter call cannot satisfy.
+        let startConfig = try #require(body.components(separatedBy: "onAdaEmbedLoaded").first)
+        #expect(startConfig.contains("deviceToken: \"device-abc123\""))
+
+        #expect(body.contains("setDeviceToken(\"device-abc123\")"))
+    }
+
+    /// A whitespace-only token is truthy, so without the `.trimmingCharacters` guard it
+    /// would seed a bogus device_token/device_os binding on the first chatter. Mirror
+    /// Android's isNotBlank and RN's isNonBlankToken: it is treated as absent — no
+    /// init-time `deviceToken:` field and no `setDeviceToken` fallback call — while the
+    /// rest of the start config is still emitted.
+    @Test
+    static func `legacy start config ignores a whitespace-only device token`() throws {
+        let body = try #require(startBody(sensitiveMetafields: [:], deviceToken: "   "))
+
+        // Slice ahead of the setter (and its comment, which names deviceToken) to isolate
+        // the start config's own init-time fields.
+        let startConfig = try #require(body.components(separatedBy: "onAdaEmbedLoaded").first)
+        #expect(startConfig.contains("handle: \"ada-example\""))
+        #expect(!startConfig.contains("deviceToken:"))
+        #expect(!body.contains("setDeviceToken("))
+    }
+}
+
+/// Executes an emitted `__ADA_WEBVIEW_CONFIG__` document-start script against a
+/// fake `window` in JavaScriptCore, so tests exercise the real runtime behavior —
+/// including the credential document-guard — rather than approximating it by
+/// string parsing.
+@MainActor
+enum AdaWebViewConfigScriptHarness {
+    /// JavaScriptCore has no `URLSearchParams`; the credential document-guard uses
+    /// `.get("handle")`, so provide a minimal polyfill supporting exactly that.
+    private static let urlSearchParamsPolyfill = """
+    function URLSearchParams(search) { this._s = String(search || ""); }
+    URLSearchParams.prototype.get = function (name) {
+      var q = this._s.charAt(0) === "?" ? this._s.slice(1) : this._s;
+      if (q === "") { return null; }
+      var pairs = q.split("&");
+      for (var i = 0; i < pairs.length; i++) {
+        var eq = pairs[i].indexOf("=");
+        var k = eq === -1 ? pairs[i] : pairs[i].slice(0, eq);
+        var v = eq === -1 ? "" : pairs[i].slice(eq + 1);
+        if (decodeURIComponent(k) === name) { return decodeURIComponent(v); }
+      }
+      return null;
+    };
+    """
+
+    private static func jsLiteral(_ value: String) throws -> String {
+        try String(
+            data: JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed),
+            encoding: .utf8,
+        ) ?? "\"\""
+    }
+
+    /// Runs `script` for a document at `origin`/`pathname`/`search`. `consumedMarker`
+    /// seeds the sessionStorage value the runtime writes after consuming a token, and
+    /// `"throws"` simulates a storage-disabled webview. Returns the delivered config,
+    /// or nil when the script delivered nothing.
+    static func run(
+        _ script: WKUserScript,
+        origin: String,
+        pathname: String = "/sdk/webview.html",
+        search: String = "?handle=ada-example",
+        consumedMarker: String? = nil,
+    ) throws -> [String: Any]? {
+        let context = try #require(JSContext())
+        let getItemBody = if consumedMarker == "throws" {
+            "throw new Error(\"storage disabled\");"
+        } else if let consumedMarker {
+            "return key === \"__ada_identity_token_consumed__\" ? \(try jsLiteral(consumedMarker)) : null;"
+        } else {
+            "return null;"
+        }
+        context.evaluateScript(urlSearchParamsPolyfill)
+        context.evaluateScript(
+            "var window = { location: { origin: \(try jsLiteral(origin)), "
+                + "pathname: \(try jsLiteral(pathname)), search: \(try jsLiteral(search)) }, "
+                + "sessionStorage: { getItem: function (key) { \(getItemBody) } } };",
+        )
+        context.evaluateScript(script.source)
+        let json = context.evaluateScript(
+            "JSON.stringify(window.__ADA_WEBVIEW_CONFIG__ === undefined ? null : window.__ADA_WEBVIEW_CONFIG__)",
+        )?.toString() ?? "null"
+        return try JSONSerialization.jsonObject(
+            with: Data(json.utf8),
+            options: .fragmentsAllowed,
+        ) as? [String: Any]
+    }
+}
+
+@MainActor
 enum AdaWebViewConfigScriptTests {
-    /// Splits the guarded config script into the trusted origin it checks, the
-    /// full payload it delivers to a fresh document, and (for token-bearing
-    /// scripts) the retained payload it delivers once the token was consumed.
-    /// Both guards are load-bearing: a WKUserScript re-executes on every
-    /// main-frame document of any origin, so the origin guard keeps the token
-    /// off foreign pages and the consumed-marker guard keeps the spent one-shot
-    /// token off later documents of the trusted origin.
-    private static func configScriptParts(
+    /// The (pathname, handle) the credential injection is bound to, parsed from the
+    /// emitted document-guard. Nil when the script carries no credential block.
+    static func credentialDocumentBinding(
+        from source: String,
+    ) -> (pathname: String, handle: String)? {
+        let pathMarker = ".toLowerCase().endsWith("
+        let handleMarker = "new URLSearchParams(window.location.search).get(\"handle\") === "
+        guard let pathStart = source.range(of: pathMarker),
+              let pathEnd = source.range(of: ") && ", range: pathStart.upperBound ..< source.endIndex),
+              let handleStart = source.range(
+                  of: handleMarker,
+                  range: pathEnd.upperBound ..< source.endIndex,
+              ),
+              let handleEnd = source.range(
+                  of: ") {",
+                  range: handleStart.upperBound ..< source.endIndex,
+              )
+        else { return nil }
+        let pathJson = String(source[pathStart.upperBound ..< pathEnd.lowerBound])
+        let handleJson = String(source[handleStart.upperBound ..< handleEnd.lowerBound])
+        guard let pathname = (try? JSONSerialization.jsonObject(
+            with: Data(pathJson.utf8),
+            options: .fragmentsAllowed,
+        )) as? String,
+            let handle = (try? JSONSerialization.jsonObject(
+                with: Data(handleJson.utf8),
+                options: .fragmentsAllowed,
+            )) as? String
+        else { return nil }
+        return (pathname, handle)
+    }
+
+    /// The token's `injectionId` — the value the consumed-marker guard compares
+    /// against, parsed from a token-bearing script so the retained payload can be
+    /// forced by seeding it.
+    private static func injectionId(from source: String) -> String? {
+        let marker = "getItem(\"__ada_identity_token_consumed__\") === "
+        guard let start = source.range(of: marker),
+              let end = source.range(of: ")", range: start.upperBound ..< source.endIndex)
+        else { return nil }
+        let idJson = String(source[start.upperBound ..< end.lowerBound])
+        return (try? JSONSerialization.jsonObject(
+            with: Data(idJson.utf8),
+            options: .fragmentsAllowed,
+        )) as? String
+    }
+
+    /// The origin the script guards on (still string-extracted: the origin guard
+    /// prefix is unchanged), plus the config a fresh document receives and — for a
+    /// token-bearing script — the retained config a later (spent-token) document
+    /// receives. Both are produced by executing the script against the document it
+    /// binds its credential to, so credential coverage reflects real behavior.
+    static func configScriptParts(
         from script: WKUserScript,
     ) throws -> (origin: String, payload: [String: Any], retained: [String: Any]?) {
         let source = script.source
         let guardPrefix = "if (window.location.origin === "
         #expect(source.hasPrefix(guardPrefix))
-
-        let plainAssignment = ") { window.__ADA_WEBVIEW_CONFIG__ = "
-        let guardedAssignment = ") { window.__ADA_WEBVIEW_CONFIG__ = (function () { "
-            + "try { if (window.sessionStorage.getItem(\"__ada_identity_token_consumed__\") === "
-
-        if let assignmentRange = source.range(of: guardedAssignment) {
-            let suffix = "; })(); }"
-            #expect(source.hasSuffix(suffix))
-            let originStart = source.index(source.startIndex, offsetBy: guardPrefix.count)
-            let originJson = String(source[originStart ..< assignmentRange.lowerBound])
-            let retainedMarker = ") { return "
-            let retainedRange = try #require(
-                source.range(of: retainedMarker, range: assignmentRange.upperBound ..< source.endIndex),
-            )
-            let retainedEnd = try #require(
-                source.range(of: "; } } catch (e) {} return ", range: retainedRange.upperBound ..< source.endIndex),
-            )
-            let retainedJson = String(source[retainedRange.upperBound ..< retainedEnd.lowerBound])
-            let payloadJson = String(source[retainedEnd.upperBound...].dropLast(suffix.count))
-            let origin = try JSONSerialization.jsonObject(
+        let originEnd = try #require(source.range(of: ") {"))
+        let originStart = source.index(source.startIndex, offsetBy: guardPrefix.count)
+        let originJson = String(source[originStart ..< originEnd.lowerBound])
+        let origin = try #require(
+            JSONSerialization.jsonObject(
                 with: Data(originJson.utf8),
                 options: .fragmentsAllowed,
-            )
-            let payload = try JSONSerialization.jsonObject(with: Data(payloadJson.utf8))
-            let retained = try JSONSerialization.jsonObject(with: Data(retainedJson.utf8))
-            return try (
-                #require(origin as? String),
-                #require(payload as? [String: Any]),
-                #require(retained as? [String: Any]),
+            ) as? String,
+        )
+
+        let binding = credentialDocumentBinding(from: source)
+        let pathname = binding?.pathname ?? "/sdk/webview.html"
+        let handle = binding?.handle ?? "ada-example"
+        let search = "?handle=" + handle
+        // Both token and no-token scripts now use an IIFE, so detect the token by its
+        // own marker (the consumed-token sessionStorage guard), not the function wrapper.
+        let isToken = source.contains("window.sessionStorage.getItem(")
+
+        let payload = try #require(try AdaWebViewConfigScriptHarness.run(
+            script,
+            origin: origin,
+            pathname: pathname,
+            search: search,
+        ))
+        var retained: [String: Any]?
+        if isToken {
+            let consumed = try #require(injectionId(from: source))
+            retained = try AdaWebViewConfigScriptHarness.run(
+                script,
+                origin: origin,
+                pathname: pathname,
+                search: search,
+                consumedMarker: consumed,
             )
         }
-
-        let suffix = "; }"
-        #expect(source.hasSuffix(suffix))
-        let assignmentRange = try #require(source.range(of: plainAssignment))
-        let originStart = source.index(source.startIndex, offsetBy: guardPrefix.count)
-        let originJson = String(source[originStart ..< assignmentRange.lowerBound])
-        let payloadJson = String(source[assignmentRange.upperBound...].dropLast(suffix.count))
-        let origin = try JSONSerialization.jsonObject(
-            with: Data(originJson.utf8),
-            options: .fragmentsAllowed,
-        )
-        let payload = try JSONSerialization.jsonObject(with: Data(payloadJson.utf8))
-        return try (#require(origin as? String), #require(payload as? [String: Any]), nil)
+        return (origin, payload, retained)
     }
 
-    private static func configPayload(from script: WKUserScript) throws -> [String: Any] {
+    static func configPayload(from script: WKUserScript) throws -> [String: Any] {
         try configScriptParts(from: script).payload
     }
 
@@ -1787,6 +2008,196 @@ enum AdaWebViewConfigScriptTests {
 
 // ---------------------------------------------------------------------------
 
+// MARK: - AdaWebViewConfigSensitiveFieldsTests
+
+// ---------------------------------------------------------------------------
+
+/// EXP-1223: host-supplied sensitive metafields ride the injected config so an identified
+/// Messaging session carries them from the first chatter. Reuses `AdaWebViewConfigScriptTests`'
+/// guarded-script parser.
+@MainActor
+enum AdaWebViewConfigSensitiveFieldsTests {
+    /// Sensitive metafields travel as a JSON-encoded STRING, not a nested object, so the Messaging
+    /// runtime parses them outside its string-only injected-config allowlist. Fails if the value is
+    /// an object rather than a re-parseable string.
+    private static func sensitiveField(_ key: String, from value: Any?) throws -> String? {
+        let json = try #require(value as? String)
+        let map = try #require(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        return map[key] as? String
+    }
+
+    /// The value is a JSON string (never a nested object). On the INITIAL injection
+    /// it is bound to this mount's own document (webview.html tail AND handle), and
+    /// rides both branches of that pre-ready script (fresh and spent-token), while a
+    /// same-origin nav to another bot gets nothing (see
+    /// `AdaWebViewConfigScriptExecutionTests`).
+    @Test
+    static func `forwards sensitive meta fields as a JSON string in both payloads`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: ["authToken": "sensitive-value"],
+            environment: .production,
+            webSdk: .messaging,
+            identityToken: "secret-jwt-token",
+        )
+        let parts = try AdaWebViewConfigScriptTests.configScriptParts(
+            from: #require(host.makeWebviewConfigScript()),
+        )
+        let retained = try #require(parts.retained)
+
+        #expect(parts.payload["sensitiveMetaFields"] as? [String: Any] == nil)
+        #expect(try sensitiveField("authToken", from: parts.payload["sensitiveMetaFields"]) == "sensitive-value")
+        #expect(try sensitiveField("authToken", from: retained["sensitiveMetaFields"]) == "sensitive-value")
+    }
+
+    /// EXP-1223 (grJTI/grJTO): the credential rides the retained re-arm too — so a
+    /// reload / in-place recovery delivers it at document-start (before the first
+    /// chatter) rather than only after `sdk.ready` — but document-bound (webview.html
+    /// tail AND handle), and built from the CURRENT backing field. `appUrl`/the mirror
+    /// flag re-arm alongside it.
+    @Test
+    static func `the retained re-arm carries the current credential, document-bound`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: ["authToken": "sensitive-value"],
+            environment: .production,
+            webSdk: .messaging,
+            appUrl: "https://apps.example.com/custom-app/index.html",
+        )
+        // JSONSerialization escapes the path's slashes as \/, so assert the guard
+        // markers, not the raw path literal; the execution tests prove the guard
+        // resolves correctly.
+        for script in [
+            try #require(host.makeWebviewConfigScript()),
+            try #require(host.makeWebviewConfigScript(retainedOnly: true)),
+        ] {
+            #expect(script.source.contains("sensitive-value"))
+            #expect(script.source.contains("appUrl"))
+            #expect(script.source.contains("nativeSessionMirrorSupported"))
+            #expect(
+                script.source.contains(
+                    "String(window.location.pathname || \"\").toLowerCase().endsWith(",
+                ),
+            )
+            // The config is built inside an IIFE, so `__adaCfg` never leaks to a
+            // `window.__adaCfg` global that would outlive the runtime's delete of
+            // `window.__ADA_WEBVIEW_CONFIG__` (EXP-1223).
+            #expect(script.source.contains("window.__ADA_WEBVIEW_CONFIG__ = (function () {"))
+            #expect(
+                script.source.contains(
+                    "new URLSearchParams(window.location.search).get(\"handle\") === \"ada-example\"",
+                ),
+            )
+        }
+    }
+
+    /// EXP-1223 grJTI: after the runtime is ready, a `setSensitiveMetaFields` REBUILDS
+    /// the armed document-start re-arm from the current backing field, so a later
+    /// document injects the updated credential — not the value armed at the last
+    /// `sdk.ready`. Without the refresh the armed script would still carry the stale
+    /// value until the next ready.
+    @Test
+    static func `a post-ready setter refreshes the armed re-arm with the updated credential`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: ["authToken": "stale-value"],
+            environment: .production,
+            webSdk: .messaging,
+        )
+        // Reach ready: disarm re-arms the retained script from the init value.
+        host.adaBridgeDidBecomeReady(host.bridgeHandler)
+        let armedBefore = try #require(host.webviewConfigUserScript)
+        #expect(armedBefore.source.contains("stale-value"))
+
+        host.setSensitiveMetaFields(["authToken": "fresh-value"])
+
+        let armedAfter = try #require(host.webviewConfigUserScript)
+        #expect(armedAfter.source.contains("fresh-value"))
+        #expect(!armedAfter.source.contains("stale-value"))
+    }
+
+    /// No sensitive metafields means no key at all — the runtime must not receive an empty
+    /// `sensitiveMetaFields` string to parse.
+    @Test
+    static func `emits no sensitive meta fields key when the host has none`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: [:],
+            environment: .production,
+            webSdk: .messaging,
+        )
+        let payload = try AdaWebViewConfigScriptTests.configPayload(
+            from: #require(host.makeWebviewConfigScript()),
+        )
+
+        #expect(payload["sensitiveMetaFields"] == nil)
+        #expect(payload["nativeSessionMirrorSupported"] as? Bool == true)
+    }
+
+    /// grJTI/defect-3: the setter MERGES into the backing field (matching the web
+    /// runtime's `{ ...existing, ...payload }`), so a later document's post-ready
+    /// re-send carries the session's full credential set — a partial update updates
+    /// the changed key and keeps the others, never dropping them.
+    @Test
+    static func `the sensitive-fields setter merges into the backing field`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: ["otc_token": "A", "region": "us"],
+            environment: .production,
+            webSdk: .messaging,
+        )
+        host.setSensitiveMetaFields(["otc_token": "B"])
+        let payload = try AdaWebViewConfigScriptTests.configPayload(
+            from: #require(host.makeWebviewConfigScript()),
+        )
+        #expect(try sensitiveField("otc_token", from: payload["sensitiveMetaFields"]) == "B")
+        #expect(try sensitiveField("region", from: payload["sensitiveMetaFields"]) == "us")
+    }
+
+    /// grJTI/defect-1: a reset with no sensitive fields CLEARS the backing field
+    /// (matching the web RESET handler, which replaces them with the reset's value —
+    /// undefined when omitted), so a later document does not resurrect a credential
+    /// the reset dropped.
+    @Test
+    static func `a reset without sensitive fields clears the backing field`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: ["otc_token": "A"],
+            environment: .production,
+            webSdk: .messaging,
+        )
+        host.reset(metaFields: MetaFields.Builder())
+        let payload = try AdaWebViewConfigScriptTests.configPayload(
+            from: #require(host.makeWebviewConfigScript()),
+        )
+        #expect(payload["sensitiveMetaFields"] == nil)
+    }
+
+    /// SUP-42: a device_token/device_os carried inside sensitiveMetaFields must be
+    /// stripped from the document-start injection. The Messaging init sensitive path
+    /// does not strip SDK-owned keys, so an unstripped device_token would ride into the
+    /// first chatter with no device_os and double-register. iOS delivers the device
+    /// token via the post-ready setter, so the injected credential carries no device
+    /// binding at all.
+    @Test
+    static func `strips device keys from the injected sensitive meta fields`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: ["otc_token": "A", "device_token": "apns-xyz", "device_os": "IOS"],
+            environment: .production,
+            webSdk: .messaging,
+        )
+        let payload = try AdaWebViewConfigScriptTests.configPayload(
+            from: #require(host.makeWebviewConfigScript()),
+        )
+        #expect(try sensitiveField("otc_token", from: payload["sensitiveMetaFields"]) == "A")
+        #expect(try sensitiveField("device_token", from: payload["sensitiveMetaFields"]) == nil)
+        #expect(try sensitiveField("device_os", from: payload["sensitiveMetaFields"]) == nil)
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 // MARK: - AdaWebViewConfigScriptExecutionTests
 
 // ---------------------------------------------------------------------------
@@ -1802,33 +2213,17 @@ enum AdaWebViewConfigScriptExecutionTests {
     private static func runConfigScript(
         _ script: WKUserScript,
         origin: String,
+        pathname: String = "/sdk/webview.html",
+        search: String = "?handle=ada-example",
         consumedMarker: String? = nil,
     ) throws -> [String: Any]? {
-        let context = try #require(JSContext())
-        let originJson = try String(
-            data: JSONSerialization.data(withJSONObject: origin, options: .fragmentsAllowed),
-            encoding: .utf8,
-        ) ?? "\"\""
-        let getItemBody = if consumedMarker == "throws" {
-            "throw new Error(\"storage disabled\");"
-        } else if let consumedMarker {
-            "return key === \"__ada_identity_token_consumed__\" ? \"\(consumedMarker)\" : null;"
-        } else {
-            "return null;"
-        }
-        context.evaluateScript(
-            "var window = { location: { origin: \(originJson) }, "
-                + "sessionStorage: { getItem: function (key) { \(getItemBody) } } };",
+        try AdaWebViewConfigScriptHarness.run(
+            script,
+            origin: origin,
+            pathname: pathname,
+            search: search,
+            consumedMarker: consumedMarker,
         )
-        context.evaluateScript(script.source)
-        let json = context.evaluateScript(
-            "JSON.stringify(window.__ADA_WEBVIEW_CONFIG__ === undefined ? null : window.__ADA_WEBVIEW_CONFIG__)",
-        )?.toString() ?? "null"
-        let parsed = try JSONSerialization.jsonObject(
-            with: Data(json.utf8),
-            options: .fragmentsAllowed,
-        )
-        return parsed as? [String: Any]
     }
 
     private static func makeHost() -> AdaWebHost {
@@ -1924,6 +2319,146 @@ enum AdaWebViewConfigScriptExecutionTests {
             ) == nil,
         )
     }
+
+    /// EXP-1223 (grJTI): the one-shot identity token is a credential, so a same-origin
+    /// nav to webview.html?handle=<other-bot> must NOT receive it — origin alone is not
+    /// identity. Non-credential config (appUrl, the mirror flag) stays on the looser
+    /// origin-only guard.
+    @Test
+    static func `withholds the identity token from another bot handle`() throws {
+        let script = try #require(makeHost().makeWebviewConfigScript())
+
+        let config = try #require(try runConfigScript(
+            script,
+            origin: trustedOrigin,
+            pathname: "/sdk/webview.html",
+            search: "?handle=attacker-bot",
+        ))
+
+        #expect(config["identityToken"] == nil)
+        #expect(config["injectionId"] == nil)
+        #expect(config["appUrl"] as? String == "https://apps.example.com/custom-app/index.html")
+        #expect(config["nativeSessionMirrorSupported"] as? Bool == true)
+    }
+
+    /// A different document on the same origin (another html path) must not receive the
+    /// identity token either, while non-credential config still rides.
+    @Test
+    static func `withholds the identity token from a different document path`() throws {
+        let script = try #require(makeHost().makeWebviewConfigScript())
+
+        let config = try #require(try runConfigScript(
+            script,
+            origin: trustedOrigin,
+            pathname: "/sdk/other.html",
+            search: "?handle=ada-example",
+        ))
+
+        #expect(config["identityToken"] == nil)
+        #expect(config["injectionId"] == nil)
+        #expect(config["appUrl"] as? String == "https://apps.example.com/custom-app/index.html")
+    }
+
+    private static func makeCredentialHost() -> AdaWebHost {
+        AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: ["authToken": "sensitive-value"],
+            environment: .production,
+            webSdk: .messaging,
+            appUrl: "https://apps.example.com/custom-app/index.html",
+        )
+    }
+
+    /// EXP-1223 (grJTO): the credential is delivered to this mount's own document —
+    /// matching webview.html path AND handle — even alongside unrelated query params.
+    @Test
+    static func `delivers sensitive meta fields to the bound document`() throws {
+        let script = try #require(makeCredentialHost().makeWebviewConfigScript())
+
+        let config = try #require(try runConfigScript(
+            script,
+            origin: trustedOrigin,
+            pathname: "/sdk/webview.html",
+            search: "?handle=ada-example&cluster=ada.support&language=en",
+        ))
+
+        let sensitive = try #require(config["sensitiveMetaFields"] as? String)
+        #expect(sensitive.contains("sensitive-value"))
+    }
+
+    /// Production /sdk/webview.html 302-redirects to /<build>/sdk/webview.html, so the
+    /// running document's pathname carries the inserted build segment. The guard
+    /// matches on the suffix, so the credential still reaches the real production load
+    /// (exact equality would withhold it and reintroduce the empty-at-greeting gap).
+    @Test
+    static func `delivers sensitive meta fields to the build-scoped redirect target`() throws {
+        let script = try #require(makeCredentialHost().makeWebviewConfigScript())
+
+        let config = try #require(try runConfigScript(
+            script,
+            origin: trustedOrigin,
+            pathname: "/1a2b3c4/sdk/webview.html",
+            search: "?handle=ada-example",
+        ))
+
+        let sensitive = try #require(config["sensitiveMetaFields"] as? String)
+        #expect(sensitive.contains("sensitive-value"))
+    }
+
+    /// The guard lowercases the pathname before the tail test, matching the
+    /// shared/RN/Android predicates (webview-privilege.ts, host-page.ts,
+    /// AdaMessagingView.kt). A case-variant served path must still deliver the
+    /// credential — otherwise iOS would silently withhold it while the other
+    /// platforms deliver, breaking push binding for that load.
+    @Test
+    static func `delivers sensitive meta fields to a case-variant pathname`() throws {
+        let script = try #require(makeCredentialHost().makeWebviewConfigScript())
+
+        let config = try #require(try runConfigScript(
+            script,
+            origin: trustedOrigin,
+            pathname: "/SDK/Webview.HTML",
+            search: "?handle=ada-example",
+        ))
+
+        let sensitive = try #require(config["sensitiveMetaFields"] as? String)
+        #expect(sensitive.contains("sensitive-value"))
+    }
+
+    /// The core of grJTO: a same-origin nav to webview.html?handle=<other-bot> must
+    /// NOT re-receive this session's credential. Non-credential config (appUrl, the
+    /// mirror flag) stays on the looser origin-only guard.
+    @Test
+    static func `withholds sensitive meta fields from another bot handle`() throws {
+        let script = try #require(makeCredentialHost().makeWebviewConfigScript())
+
+        let config = try #require(try runConfigScript(
+            script,
+            origin: trustedOrigin,
+            pathname: "/sdk/webview.html",
+            search: "?handle=attacker-bot",
+        ))
+
+        #expect(config["sensitiveMetaFields"] == nil)
+        #expect(config["appUrl"] as? String == "https://apps.example.com/custom-app/index.html")
+        #expect(config["nativeSessionMirrorSupported"] as? Bool == true)
+    }
+
+    /// A different document on the same origin (another html path) must not receive
+    /// the credential either.
+    @Test
+    static func `withholds sensitive meta fields from a different document path`() throws {
+        let script = try #require(makeCredentialHost().makeWebviewConfigScript())
+
+        let config = try #require(try runConfigScript(
+            script,
+            origin: trustedOrigin,
+            pathname: "/sdk/other.html",
+            search: "?handle=ada-example",
+        ))
+
+        #expect(config["sensitiveMetaFields"] == nil)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1934,11 +2469,14 @@ enum AdaWebViewConfigScriptExecutionTests {
 
 @MainActor
 enum AdaWebViewConfigScriptDisarmTests {
-    /// Once the bridge reports ready the one-shot token is spent; the
-    /// document-start registration must go away while every other user script
-    /// (cached-state hydration, error interceptor) survives the rebuild.
+    /// Once the bridge reports ready the one-shot identity token is spent, but the
+    /// per-document config (sensitiveMetaFields/appUrl/mirror flag) must keep riding
+    /// every later document. So the armed script is rebuilt as a retained-only config:
+    /// the identity token is dropped while `__ADA_WEBVIEW_CONFIG__` and every other
+    /// user script (cached-state hydration, error interceptor) survive, and the total
+    /// script count is unchanged (one removed, one re-armed).
     @Test
-    static func `removes only the config script once the bridge reports ready`() throws {
+    static func `re-arms a retained token-less config script once the bridge reports ready`() throws {
         let host = AdaWebHost(
             handle: "ada-example",
             environment: .production,
@@ -1953,20 +2491,29 @@ enum AdaWebViewConfigScriptDisarmTests {
         let controller = try #require(host.webviewUserContentController)
         let sourcesBefore = controller.userScripts.map(\.source)
         #expect(sourcesBefore.contains(where: { $0.contains("__ADA_WEBVIEW_CONFIG__") }))
+        #expect(sourcesBefore.contains(where: { $0.contains("secret-jwt-token") }))
         // The error interceptor must be present so the rebuild provably keeps it.
         #expect(sourcesBefore.contains(where: { $0.contains("reportBridgeError") }))
 
         host.adaBridgeDidBecomeReady(host.bridgeHandler)
 
         let sourcesAfter = controller.userScripts.map(\.source)
-        #expect(!sourcesAfter.contains(where: { $0.contains("__ADA_WEBVIEW_CONFIG__") }))
+        // The retained config still rides the document, but without the one-shot token.
+        #expect(sourcesAfter.contains(where: { $0.contains("__ADA_WEBVIEW_CONFIG__") }))
+        #expect(sourcesAfter.contains(where: { $0.contains("nativeSessionMirrorSupported") }))
+        #expect(!sourcesAfter.contains(where: { $0.contains("secret-jwt-token") }))
         #expect(sourcesAfter.contains(where: { $0.contains("reportBridgeError") }))
-        #expect(sourcesAfter.count == sourcesBefore.count - 1)
-        #expect(host.webviewConfigUserScript == nil)
+        // One removed, one retained re-armed — the count is unchanged.
+        #expect(sourcesAfter.count == sourcesBefore.count)
+        #expect(host.webviewConfigUserScript != nil)
 
-        // Idempotent: a second ready (or a ready with nothing armed) is a no-op.
+        // Idempotent: a second ready swaps the retained script for an equivalent one,
+        // never re-injecting the token nor accumulating scripts.
         host.adaBridgeDidBecomeReady(host.bridgeHandler)
-        #expect(controller.userScripts.count == sourcesAfter.count)
+        let sourcesAfterSecond = controller.userScripts.map(\.source)
+        #expect(sourcesAfterSecond.count == sourcesAfter.count)
+        #expect(!sourcesAfterSecond.contains(where: { $0.contains("secret-jwt-token") }))
+        #expect(sourcesAfterSecond.contains(where: { $0.contains("__ADA_WEBVIEW_CONFIG__") }))
     }
 }
 
@@ -2753,6 +3300,75 @@ enum AdaWebHostConsumedIdentityTokenTests {
 
         #expect(host.consumedIdentityToken == nil)
     }
+
+    /// After the first ready re-arms a retained-only (token-less) script,
+    /// `webviewConfigUserScript` is non-nil but carries no token. A later ready — an
+    /// in-place reload (`webView.reload()`), which does NOT re-run `setupWebView()` —
+    /// against a token the host rotated in afterwards must NOT memo it as consumed:
+    /// it was never armed into any document, so memoing it would blank it on the next
+    /// build and strand an identified session as anonymous with no error.
+    @Test
+    static func `an in-place reload does not memo a token that was never armed`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            environment: .production,
+            webSdk: .messaging,
+            identityToken: "token-A",
+        )
+
+        // First ready consumes A and re-arms the retained-only (token-less) config,
+        // leaving webviewConfigUserScript non-nil.
+        host.adaBridgeDidBecomeReady(host.bridgeHandler)
+        #expect(host.consumedIdentityToken == "token-A")
+        #expect(host.webviewConfigUserScript != nil)
+
+        // Host rotates the token; an in-place reload does not re-run setupWebView, so
+        // token-B is never armed into a document.
+        host.identityToken = "token-B"
+        host.adaBridgeDidBecomeReady(host.bridgeHandler)
+
+        // token-B was never delivered, so it must not be memoed as consumed...
+        #expect(host.consumedIdentityToken == "token-A")
+        // ...and it can still be armed for a later document.
+        let next = try #require(host.makeWebviewConfigScript())
+        #expect(next.source.contains("token-B"))
+    }
+
+    /// `teardownWebView()` must clear `armedIdentityToken` together with
+    /// `webviewConfigUserScript`. The armed token is the sole input to the
+    /// consumed-token memo, so a token left armed past teardown could latch as
+    /// consumed on a later document that never received it — stranding the session
+    /// anonymous. The invariant is `webviewConfigUserScript == nil` implies
+    /// `armedIdentityToken == nil`.
+    @Test
+    static func `teardown clears the armed token so a later ready memos nothing`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            environment: .production,
+            webSdk: .messaging,
+            identityToken: "token-A",
+        )
+        // The setup path arms these two together before ready; simulate that state.
+        host.armedIdentityToken = "token-A"
+        host.webviewConfigUserScript = WKUserScript(
+            source: "true;",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true,
+        )
+
+        host.teardownWebView()
+
+        #expect(host.armedIdentityToken == nil)
+        #expect(host.webviewConfigUserScript == nil)
+
+        // A ready after teardown, before any new document is armed, must not memo the
+        // still-unused token as consumed...
+        host.adaBridgeDidBecomeReady(host.bridgeHandler)
+        #expect(host.consumedIdentityToken == nil)
+        // ...so it can still be armed for the next document.
+        let next = try #require(host.makeWebviewConfigScript())
+        #expect(next.source.contains("token-A"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2802,10 +3418,10 @@ enum AdaWebHostTrustedOriginWiringTests {
     }
 
     @Test
-    static func `fails closed for a non-http custom assets origin`() {
-        let host = AdaWebHost(
+    static func `fails closed for a non-http custom assets origin`() throws {
+        let host = try AdaWebHost(
             handle: "ada-example",
-            environment: .custom(assetsOrigin: URL(string: "file:///tmp/assets")!),
+            environment: .custom(assetsOrigin: #require(URL(string: "file:///tmp/assets"))),
             webSdk: .messaging,
         )
         #expect(host.bridgeHandler.trustedOrigin == nil)

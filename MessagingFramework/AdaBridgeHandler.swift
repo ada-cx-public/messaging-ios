@@ -30,6 +30,13 @@
 import Foundation
 import WebKit
 
+// swiftlint:disable file_length
+// The EXP-1225 correlated request/response bridge (sendBridgeRequest and its
+// pending-request bookkeeping) shares file-private state and helpers with the
+// existing session-mirror + event handling, so it cannot move to a separate
+// extension file without widening that encapsulation. The file stays cohesive;
+// split it if a genuinely independent concern is added later.
+
 // ---------------------------------------------------------------------------
 
 // MARK: - AdaDocumentTicket
@@ -51,6 +58,35 @@ import WebKit
 struct AdaDocumentTicket: Equatable {
     let webView: ObjectIdentifier
     let documentUrl: String
+}
+
+// ---------------------------------------------------------------------------
+
+// MARK: - AdaBridgeRequestResult
+
+// ---------------------------------------------------------------------------
+
+/// The single answer to a curated request/response bridge call (EXP-1225).
+///
+/// Every call settles exactly once: the runtime replies, the runtime's build
+/// lacks the method, the call errors, or native's own timeout fires. `result`
+/// carries the JSON-decoded public read model (or `nil` for a write/trigger the
+/// runtime resolves with no value); it never carries `sensitiveMetaFields`, a
+/// raw store, or the session-mirror blob — the web-side allowlist guarantees
+/// that.
+public enum AdaBridgeRequestResult {
+    /// The runtime answered. `value` is the decoded result, or `nil` for a
+    /// value-less resolution (writes/triggers, or an explicit JSON `null`).
+    case success(Any?)
+
+    /// The method is on the shared allowlist but the runtime build this mount
+    /// loaded does not implement it — an explicit signal, never a silent drop,
+    /// so a host can tell "not on this runtime" from "failed".
+    case unsupported
+
+    /// The call could not be answered: an off-allowlist method, a runtime
+    /// error, a document that changed before the reply, or a timeout.
+    case failure(String)
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +278,38 @@ struct AdaDocumentTicket: Equatable {
     /// Tests substitute an inline runner.
     var sessionMirrorMainRunner: (@escaping () -> Void) -> Void = { work in
         DispatchQueue.main.async(execute: work)
+    }
+
+    /// Outer native bound on a curated bridge request (EXP-1225), so a caller's
+    /// completion always settles even if the runtime never replies. Set above the
+    /// web side's own `BRIDGE_REQUEST_TIMEOUT_MS` (30s) so a stalled call normally
+    /// surfaces the runtime's `error` reply, and this is only the last resort.
+    static let bridgeRequestTimeout: TimeInterval = 35
+
+    /// Cap on outstanding curated requests, mirroring React Native's
+    /// `MAX_PENDING_BRIDGE_REQUESTS`. A host polling reads before `sdk.ready`
+    /// otherwise grows the pending map and its per-request main-queue timers without
+    /// bound. Kept in lockstep across RN/iOS/Android by the drift gate.
+    static let maxPendingBridgeRequests = 64
+
+    /// One outstanding curated request keyed by its `requestId`.
+    private struct PendingBridgeRequest {
+        /// The document the request was accepted into, redeemed on reply so an
+        /// answer from a document that later took the frame is discarded.
+        let ticket: AdaDocumentTicket
+        weak var webView: WKWebView?
+        let completion: (AdaBridgeRequestResult) -> Void
+    }
+
+    /// Curated requests awaiting their single `sdk.response`, keyed by `requestId`.
+    private var pendingBridgeRequests: [String: PendingBridgeRequest] = [:]
+
+    /// Schedules a bridge request's timeout fire. Settling is idempotent — a fire
+    /// after the request already settled is a no-op — so no canceller is needed.
+    /// Tests substitute a runner that captures the fire block so the timeout path
+    /// is observable synchronously.
+    var bridgeRequestTimeoutRunner: (TimeInterval, @escaping () -> Void) -> Void = { delay, work in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     // -----------------------------------------------------------------------
@@ -436,6 +504,9 @@ struct AdaDocumentTicket: Equatable {
         case "sdk.session.mirror", "sdk.session.mirrorClear", "sdk.session.mirrorRequest",
              "sdk.session.mirrorDiagnostic":
             routeSessionMirrorMessage(type: type, body: body)
+
+        case "sdk.response":
+            handleBridgeResponse(body)
 
         case "sdk.zdChatterAuthRequest":
             delegate?.adaBridgeDidRequestZendeskChatterAuth?(self)
@@ -743,6 +814,125 @@ struct AdaDocumentTicket: Equatable {
             script: "if(window.__ADA_BRIDGE_DISPATCH__){window.__ADA_BRIDGE_DISPATCH__(`\(escaped)`)}true;",
             to: webView,
         )
+    }
+
+    // -----------------------------------------------------------------------
+
+    // MARK: - Curated request/response bridge (EXP-1225)
+
+    // -----------------------------------------------------------------------
+
+    /// Issues one curated `ada.request` into the runtime and settles `completion`
+    /// with the single `sdk.response` that answers it.
+    ///
+    /// `method` is one of the shared allowlist (`BRIDGE_REQUEST_METHODS` in
+    /// `packages/sdk/src/mobile-webview-runtime.ts`); an off-allowlist method is
+    /// answered by the runtime with a `failure`. A method the loaded runtime build
+    /// does not implement settles `unsupported` — runtime parity without native
+    /// having to know which build is mounted. The reply is bound to the document
+    /// the request was accepted into, so an answer arriving after the frame was
+    /// replaced is discarded and the caller settles `failure` instead.
+    func sendBridgeRequest(
+        method: String,
+        params: [String: Any]?,
+        to webView: WKWebView,
+        completion: @escaping (AdaBridgeRequestResult) -> Void,
+    ) {
+        guard let ticket = captureDocumentTicket(for: webView) else {
+            completion(.failure("No live Ada runtime document to receive the request"))
+            return
+        }
+
+        if pendingBridgeRequests.count >= Self.maxPendingBridgeRequests {
+            completion(.failure("Too many bridge requests are awaiting a response"))
+            return
+        }
+
+        let requestId = UUID().uuidString
+        var command: [String: Any] = [
+            "type": "ada.request",
+            "requestId": requestId,
+            "method": method,
+        ]
+        if let params {
+            command["params"] = params
+        }
+
+        // Register before dispatch so a synchronous reply (in tests) is correlated.
+        pendingBridgeRequests[requestId] = PendingBridgeRequest(
+            ticket: ticket,
+            webView: webView,
+            completion: completion,
+        )
+        bridgeRequestTimeoutRunner(Self.bridgeRequestTimeout) { [weak self] in
+            self?.settleBridgeRequest(requestId: requestId, result: .failure("Bridge request timed out"))
+        }
+
+        if !dispatchCommand(command, to: webView, ticket: ticket) {
+            settleBridgeRequest(
+                requestId: requestId,
+                result: .failure("Could not reach the Ada runtime document"),
+            )
+        }
+    }
+
+    /// Routes one `sdk.response` to the request that is awaiting it. A reply with
+    /// no matching pending `requestId` is dropped — nothing is settled twice, and
+    /// an unsolicited reply cannot invent a callback.
+    private func handleBridgeResponse(_ body: [String: Any]) {
+        guard let requestId = body["requestId"] as? String, !requestId.isEmpty,
+              let pending = pendingBridgeRequests[requestId]
+        else { return }
+
+        // Bind the reply to the document the request was accepted into: a webview
+        // rebuild or a top-level navigation redeems a different ticket, so a reply
+        // from the departed document is not delivered as this request's answer.
+        guard let webView = pending.webView,
+              captureDocumentTicket(for: webView) == pending.ticket
+        else {
+            settleBridgeRequest(
+                requestId: requestId,
+                result: .failure("Ada runtime document changed before the response arrived"),
+            )
+            return
+        }
+
+        settleBridgeRequest(requestId: requestId, result: Self.bridgeResult(from: body))
+    }
+
+    /// Settles and removes a pending request exactly once. A second settle for the
+    /// same id (a duplicate reply, or a timeout after the reply landed) is a no-op.
+    private func settleBridgeRequest(requestId: String, result: AdaBridgeRequestResult) {
+        guard let pending = pendingBridgeRequests.removeValue(forKey: requestId) else { return }
+        pending.completion(result)
+    }
+
+    /// Fails every outstanding request — call when the runtime the requests were
+    /// issued into is gone (webview teardown/rebuild), so no caller is stranded to
+    /// its timeout.
+    func cancelPendingBridgeRequests(reason: String = "Ada runtime was torn down") {
+        let pending = pendingBridgeRequests
+        pendingBridgeRequests.removeAll()
+        for (_, entry) in pending {
+            entry.completion(.failure(reason))
+        }
+    }
+
+    /// Maps a `sdk.response` envelope to its result. `unsupported` wins over
+    /// `error`/`result` so a runtime that lacks a method is never reported as a
+    /// failure; an explicit JSON `null` result decodes to `success(nil)`.
+    static func bridgeResult(from body: [String: Any]) -> AdaBridgeRequestResult {
+        if body["unsupported"] as? Bool == true {
+            return .unsupported
+        }
+        if let error = body["error"] as? String {
+            return .failure(error)
+        }
+        if body.keys.contains("result") {
+            let value = body["result"]
+            return .success(value is NSNull ? nil : value)
+        }
+        return .failure("Malformed bridge response")
     }
 
     // -----------------------------------------------------------------------
