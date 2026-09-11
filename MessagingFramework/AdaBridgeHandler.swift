@@ -85,7 +85,8 @@ public enum AdaBridgeRequestResult {
     case unsupported
 
     /// The call could not be answered: an off-allowlist method, a runtime
-    /// error, a document that changed before the reply, or a timeout.
+    /// error, a document that changed before the reply, a timeout, or a malformed
+    /// no-outcome envelope (`Malformed bridge response`).
     case failure(String)
 }
 

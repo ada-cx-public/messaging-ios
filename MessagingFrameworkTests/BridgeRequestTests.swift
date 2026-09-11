@@ -178,6 +178,97 @@ struct AdaBridgeHandlerRequestTests {
         #expect(value == nil)
     }
 
+    @Test
+    func `a response with no outcome settles as a malformed failure`() throws {
+        // None of result/error/unsupported. A success always carries an explicit `result`
+        // key (`result: null` for a void resolve), so a no-outcome envelope is malformed and
+        // must reject rather than resolve a fabricated nil.
+        let fixture = Fixture()
+        var results: [AdaBridgeRequestResult] = []
+        fixture.handler.sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
+        let id = try requestId(from: fixture.webView)
+
+        fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "generation": 1])
+
+        guard case let .failure(message) = try #require(results.first) else {
+            Issue.record("expected failure")
+            return
+        }
+        #expect(message == "Malformed bridge response")
+    }
+
+    // The value-keyed reject arms: a non-string `error` (`as? String` nil) or a coerced-string
+    // `unsupported` (`as? Bool == true` false) is not an outcome, so with no `result` key both
+    // fall through to the malformed reject. Pins the `as? String` / `as? Bool` keying that makes
+    // the three platforms agree; a presence-keyed rewrite (`keys.contains("error")`) would pass
+    // the other iOS cases but diverge from Android and RN here.
+    @Test
+    func `a non-string error with no result settles as a malformed failure`() throws {
+        let fixture = Fixture()
+        var results: [AdaBridgeRequestResult] = []
+        fixture.handler.sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
+        let id = try requestId(from: fixture.webView)
+
+        fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "error": NSNull()])
+
+        guard case let .failure(message) = try #require(results.first) else {
+            Issue.record("expected failure")
+            return
+        }
+        #expect(message == "Malformed bridge response")
+    }
+
+    @Test
+    func `a coerced-string unsupported with no result settles as a malformed failure`() throws {
+        let fixture = Fixture()
+        var results: [AdaBridgeRequestResult] = []
+        fixture.handler.sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
+        let id = try requestId(from: fixture.webView)
+
+        fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "unsupported": "true"])
+
+        guard case let .failure(message) = try #require(results.first) else {
+            Issue.record("expected failure")
+            return
+        }
+        #expect(message == "Malformed bridge response")
+    }
+
+    // Outcome precedence: a non-string `error` or a coerced-string `unsupported` that also
+    // carries a `result` settles success (the result branch), because the error/unsupported
+    // branches key on the value type. Pins the same precedence Android and RN pin behaviorally.
+    @Test
+    func `a non-string error alongside a result settles success`() throws {
+        let fixture = Fixture()
+        var results: [AdaBridgeRequestResult] = []
+        fixture.handler.sendBridgeRequest(method: "getInfo", params: nil, to: fixture.webView) { results.append($0) }
+        let id = try requestId(from: fixture.webView)
+
+        fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "error": NSNull(), "result": "ok"])
+
+        guard case let .success(value) = try #require(results.first) else {
+            Issue.record("expected success")
+            return
+        }
+        #expect(value as? String == "ok")
+    }
+
+    @Test
+    func `a coerced-string unsupported alongside a result settles success`() throws {
+        let fixture = Fixture()
+        var results: [AdaBridgeRequestResult] = []
+        fixture.handler.sendBridgeRequest(method: "getInfo", params: nil, to: fixture.webView) { results.append($0) }
+        let id = try requestId(from: fixture.webView)
+
+        fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "unsupported": "true", "result": "ok"])
+
+        guard case let .success(value) = try #require(results.first) else {
+            Issue.record("expected success")
+            return
+        }
+        #expect(value as? String == "ok")
+    }
+
     /// A reply whose `requestId` matches nothing outstanding must not invent a
     /// callback or crash — the request registry is the only thing that can settle
     /// a caller.
