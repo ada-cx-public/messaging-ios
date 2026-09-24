@@ -34,7 +34,7 @@ Xcode:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.4.1"),
+    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.4.2"),
 ],
 targets: [
     .target(
@@ -47,7 +47,7 @@ targets: [
 ### CocoaPods
 
 ```ruby
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.4.1"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.4.2"
 ```
 
 ### Carthage
@@ -138,7 +138,7 @@ import AdaMessaging
 pod "AdaEmbedFramework"
 
 # After
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.4.1"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.4.2"
 ```
 
 ## Important Code Changes To Make
@@ -188,6 +188,9 @@ adaWebHost.reset(
 ```
 
 ## Important Developer Notes
+
+The [native auth bridge](../../docs/native-zendesk-chat-auth.md) echoes request IDs for token and null responses.
+The web runtime drops answers whose IDs do not match the pending request. Existing host callbacks need no change.
 
 - `openWebLinksInSafari` controls whether supported web links open in `SFSafariViewController`
 - `zdChatterAuthCallback` is supported for Zendesk Chat authentication flows on **both**

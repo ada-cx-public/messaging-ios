@@ -113,11 +113,11 @@ public enum AdaBridgeRequestResult {
     /// unaffected — navigation failures arrive through `WKNavigationDelegate`.
     @objc optional func adaBridge(_ bridge: AdaBridgeHandler, didFailSubresourceLoad details: [String: Any])
 
-    /// Called when the Messaging runtime asks the native host for a Zendesk Chat chatter-auth
-    /// token. The host must answer with `sendZendeskChatterAuthResponse(token:to:)` exactly
-    /// once — core's wait is bounded at 10s, and a host that never answers burns that 10s timeout
-    /// on every refresh cycle for the whole handoff rather than failing fast.
+    /// Receives auth requests when the delegate does not implement the method with a request ID.
     @objc optional func adaBridgeDidRequestZendeskChatterAuth(_ bridge: AdaBridgeHandler)
+
+    /// Answer once with `sendZendeskChatterAuthResponse(token:requestId:to:)`, preserving the request ID.
+    @objc optional func adaBridgeDidRequestZendeskChatterAuth(_ bridge: AdaBridgeHandler, requestId: String?)
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +510,12 @@ public enum AdaBridgeRequestResult {
             handleBridgeResponse(body)
 
         case "sdk.zdChatterAuthRequest":
-            delegate?.adaBridgeDidRequestZendeskChatterAuth?(self)
+            let requestId = (body["payload"] as? [String: Any])?["requestId"] as? String
+            if let requestAuth = delegate?.adaBridgeDidRequestZendeskChatterAuth(_:requestId:) {
+                requestAuth(self, requestId)
+            } else {
+                delegate?.adaBridgeDidRequestZendeskChatterAuth?(self)
+            }
 
         case "sdk.error":
             let error = body["error"] as? String ?? "Unknown bridge error"
@@ -655,10 +660,19 @@ public enum AdaBridgeRequestResult {
     /// Pass `nil` when the host has no token configured: core resolves immediately instead of
     /// waiting out the SDK's 10s auth timeout, which it would otherwise do on every cycle.
     public func sendZendeskChatterAuthResponse(token: String?, to webView: WKWebView) {
+        sendZendeskChatterAuthResponse(token: token, requestId: nil, to: webView)
+    }
+
+    /// Echo the request ID so a late host answer cannot authenticate a newer request.
+    public func sendZendeskChatterAuthResponse(token: String?, requestId: String?, to webView: WKWebView) {
+        var payload: [String: Any] = ["token": token.map { $0 as Any } ?? NSNull()]
+        if let requestId {
+            payload["requestId"] = requestId
+        }
         dispatchCommand(
             [
                 "type": "ada.zdChatterAuthResponse",
-                "payload": ["token": token.map { $0 as Any } ?? NSNull()],
+                "payload": payload,
             ],
             to: webView,
             ticket: captureDocumentTicket(for: webView),

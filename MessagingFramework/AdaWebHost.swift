@@ -83,11 +83,11 @@ public class AdaWebHost: NSObject {
     public var cluster = ""
     public var language = ""
 
-    /// Style overrides. On the Legacy runtime this is a raw CSS string passed to
-    /// `adaEmbed.start`. On the Messaging runtime it must be a JSON object of
-    /// string style tokens (e.g. `{"tintColor": "#520497"}`), sent as the
-    /// `styles` query param on the `sdk/webview.html` URL — any other shape is
-    /// dropped with a debug log. Read during init — set this at init.
+    /// Style overrides for the Legacy runtime: a raw CSS string passed to
+    /// `adaEmbed.start`. The Messaging runtime ignores this setting and logs a
+    /// notice. A JSON object value is still sent as the `styles` query param on
+    /// the `sdk/webview.html` URL, and any other shape is dropped with a debug
+    /// log. Read during init — set this at init.
     public var styles = ""
     public var greeting = ""
     public var deviceToken = ""

@@ -548,7 +548,7 @@ private final class StubbedTrustBridgeHandler: AdaBridgeHandler {
 }
 
 /// Spy delegate that records all callbacks.
-private final class SpyDelegate: NSObject, AdaBridgeDelegate {
+private class SpyDelegate: NSObject, AdaBridgeDelegate {
     var events: [(key: String, data: Any?)] = []
     var readyCalled = false
     var errors: [String] = []
@@ -575,6 +575,14 @@ private final class SpyDelegate: NSObject, AdaBridgeDelegate {
 
     func adaBridge(_: AdaBridgeHandler, didFailSubresourceLoad details: [String: Any]) {
         subresourceLoadFailures.append(details)
+    }
+}
+
+private final class CorrelatedAuthSpyDelegate: SpyDelegate {
+    var requestIds: [String?] = []
+
+    func adaBridgeDidRequestZendeskChatterAuth(_: AdaBridgeHandler, requestId: String?) {
+        requestIds.append(requestId)
     }
 }
 
@@ -692,16 +700,24 @@ extension AdaBridgeHandlerTests {
 
         // MARK: sdk.zdChatterAuthRequest
 
-        /// Previously unhandled on the Messaging runtime: the request was posted and dropped,
-        /// so core waited out its 10s timeout, PATCHed without a token, and repeated for the
-        /// whole handoff.
         @Test
-        func `sdk.zdChatterAuthRequest reaches the delegate`() {
+        func `sdk.zdChatterAuthRequest reaches an older delegate`() {
             let handler = makeHandler()
             let spy = SpyDelegate()
             handler.delegate = spy
-            send(["type": "sdk.zdChatterAuthRequest"], to: handler)
+            send(["type": "sdk.zdChatterAuthRequest", "payload": ["requestId": "auth-1"]], to: handler)
             #expect(spy.zendeskChatterAuthRequests == 1)
+        }
+
+        @Test
+        func `auth requests prefer the correlated delegate and preserve optional request IDs`() {
+            let handler = makeHandler()
+            let spy = CorrelatedAuthSpyDelegate()
+            handler.delegate = spy
+            send(["type": "sdk.zdChatterAuthRequest", "payload": ["requestId": "auth-1"]], to: handler)
+            send(["type": "sdk.zdChatterAuthRequest"], to: handler)
+            #expect(spy.requestIds == ["auth-1", nil])
+            #expect(spy.zendeskChatterAuthRequests == 0)
         }
 
         /// The runtime re-requests at every `expireIn`, so each cycle must reach the host.
@@ -897,6 +913,29 @@ extension AdaBridgeHandlerTests {
             handler.trustedOrigin = "https://messaging-assets.ada.support"
             handler.trustedDocumentUrl = "https://messaging-assets.ada.support/sdk/webview.html"
             return handler
+        }
+
+        @Test(arguments: ["visitor-token", nil] as [String?])
+        func `auth response echoes the request ID with a token or null`(token: String?) throws {
+            let handler = makeHandler()
+            let webView = ScriptCapturingWebView()
+            handler.sendZendeskChatterAuthResponse(token: token, requestId: "auth-1", to: webView)
+            let script = try #require(webView.capturedScripts.first)
+            #expect(webView.capturedScripts.count == 1)
+            #expect(script.contains("\"type\":\"ada.zdChatterAuthResponse\""))
+            #expect(script.contains("\"requestId\":\"auth-1\""))
+            #expect(script.contains(token == nil ? "\"token\":null" : "\"token\":\"visitor-token\""))
+        }
+
+        @Test
+        func `the original auth response method omits the request ID`() throws {
+            let handler = makeHandler()
+            let webView = ScriptCapturingWebView()
+            handler.sendZendeskChatterAuthResponse(token: nil, to: webView)
+            let script = try #require(webView.capturedScripts.first)
+            #expect(script.contains("\"type\":\"ada.zdChatterAuthResponse\""))
+            #expect(script.contains("\"token\":null"))
+            #expect(!script.contains("requestId"))
         }
 
         @Test

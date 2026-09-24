@@ -328,23 +328,20 @@ extension AdaWebHost: AdaBridgeDelegate {
         }
     }
 
-    /// Answer the Messaging runtime's Zendesk Chat chatter-auth handshake.
-    ///
-    /// The public `zdChatterAuthCallback` was previously wired only into the legacy
-    /// `adaEmbed.start(...)` payload, so on the Messaging runtime the request was posted and
-    /// dropped: core waited out the SDK's own 10s auth timeout, PATCHed without a token,
-    /// then rescheduled itself at `expireIn` and repeated for the whole handoff. Reuses the
-    /// same public property, so customer code needs no change.
     public func adaBridgeDidRequestZendeskChatterAuth(_ handler: AdaBridgeHandler) {
+        adaBridgeDidRequestZendeskChatterAuth(handler, requestId: nil)
+    }
+
+    public func adaBridgeDidRequestZendeskChatterAuth(_ handler: AdaBridgeHandler, requestId: String?) {
         guard let webView else { return }
+        zdChatterAuthRequestSeq &+= 1
+        let requestSeq = zdChatterAuthRequestSeq
         guard let zdChatterAuthCallback else {
             // Resolve immediately rather than burning the SDK's 10s auth timeout on a host
             // that has no token to give — the same guard the React Native handler applies.
-            handler.sendZendeskChatterAuthResponse(token: nil, to: webView)
+            handler.sendZendeskChatterAuthResponse(token: nil, requestId: requestId, to: webView)
             return
         }
-        zdChatterAuthRequestSeq &+= 1
-        let requestSeq = zdChatterAuthRequestSeq
         var hasResponded = false
         zdChatterAuthCallback { token in
             Task { @MainActor [weak self] in
@@ -356,7 +353,7 @@ extension AdaWebHost: AdaBridgeDelegate {
                 guard !hasResponded, let self, let webView = self.webView else { return }
                 guard requestSeq == zdChatterAuthRequestSeq else { return }
                 hasResponded = true
-                handler.sendZendeskChatterAuthResponse(token: token, to: webView)
+                handler.sendZendeskChatterAuthResponse(token: token, requestId: requestId, to: webView)
             }
         }
     }
