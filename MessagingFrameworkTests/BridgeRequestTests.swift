@@ -22,7 +22,7 @@ import WebKit
 /// template, undoing the template-literal escaping so the command dict is
 /// inspectable.
 @MainActor
-private func dispatchedCommand(from script: String) throws -> [String: Any] {
+func dispatchedCommand(from script: String) throws -> [String: Any] {
     let openMarker = "window.__ADA_BRIDGE_DISPATCH__(`"
     let closeMarker = "`)}true;"
     let start = try #require(script.range(of: openMarker))
@@ -85,6 +85,39 @@ struct AdaBridgeHandlerRequestTests {
         #expect(command["type"] as? String == "ada.request")
         #expect(command["method"] as? String == "getInfo")
         #expect((command["requestId"] as? String)?.isEmpty == false)
+    }
+
+    @Test(arguments: [false, true])
+    func `triggerPlaybook preserves acceptance and refusal`(refused: Bool) throws {
+        let fixture = Fixture()
+        var results: [AdaBridgeRequestResult] = []
+        fixture.handler.sendBridgeRequest(
+            method: "triggerPlaybook",
+            params: ["playbookId": "507f1f77bcf86cd799439011"],
+            to: fixture.webView,
+        ) { results.append($0) }
+        let command = try dispatchedCommand(from: #require(fixture.webView.capturedScripts.first))
+        #expect(command["type"] as? String == "ada.request")
+        #expect(command["method"] as? String == "triggerPlaybook")
+        let id = try #require(command["requestId"] as? String)
+        var reply: [String: Any] = ["type": "sdk.response", "requestId": id, "generation": 1]
+        if refused {
+            reply["error"] = "triggerPlaybook rejected: playbook_running"
+        } else {
+            reply["result"] = NSNull()
+        }
+        fixture.handler.handleBridgeMessage(reply)
+        #expect(results.count == 1)
+        switch try #require(results.first) {
+        case let .failure(reason):
+            #expect(refused)
+            #expect(reason == "triggerPlaybook rejected: playbook_running")
+        case let .success(value):
+            #expect(!refused)
+            #expect(value == nil)
+        case .unsupported:
+            Issue.record("expected acceptance or refusal")
+        }
     }
 
     @Test
@@ -185,7 +218,8 @@ struct AdaBridgeHandlerRequestTests {
         // must reject rather than resolve a fabricated nil.
         let fixture = Fixture()
         var results: [AdaBridgeRequestResult] = []
-        fixture.handler.sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
+        fixture.handler
+            .sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
         let id = try requestId(from: fixture.webView)
 
         fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "generation": 1])
@@ -197,16 +231,17 @@ struct AdaBridgeHandlerRequestTests {
         #expect(message == "Malformed bridge response")
     }
 
-    // The value-keyed reject arms: a non-string `error` (`as? String` nil) or a coerced-string
-    // `unsupported` (`as? Bool == true` false) is not an outcome, so with no `result` key both
-    // fall through to the malformed reject. Pins the `as? String` / `as? Bool` keying that makes
-    // the three platforms agree; a presence-keyed rewrite (`keys.contains("error")`) would pass
-    // the other iOS cases but diverge from Android and RN here.
+    /// The value-keyed reject arms: a non-string `error` (`as? String` nil) or a coerced-string
+    /// `unsupported` (`as? Bool == true` false) is not an outcome, so with no `result` key both
+    /// fall through to the malformed reject. Pins the `as? String` / `as? Bool` keying that makes
+    /// the three platforms agree; a presence-keyed rewrite (`keys.contains("error")`) would pass
+    /// the other iOS cases but diverge from Android and RN here.
     @Test
     func `a non-string error with no result settles as a malformed failure`() throws {
         let fixture = Fixture()
         var results: [AdaBridgeRequestResult] = []
-        fixture.handler.sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
+        fixture.handler
+            .sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
         let id = try requestId(from: fixture.webView)
 
         fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "error": NSNull()])
@@ -222,7 +257,8 @@ struct AdaBridgeHandlerRequestTests {
     func `a coerced-string unsupported with no result settles as a malformed failure`() throws {
         let fixture = Fixture()
         var results: [AdaBridgeRequestResult] = []
-        fixture.handler.sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
+        fixture.handler
+            .sendBridgeRequest(method: "getConversation", params: nil, to: fixture.webView) { results.append($0) }
         let id = try requestId(from: fixture.webView)
 
         fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "unsupported": "true"])
@@ -234,9 +270,9 @@ struct AdaBridgeHandlerRequestTests {
         #expect(message == "Malformed bridge response")
     }
 
-    // Outcome precedence: a non-string `error` or a coerced-string `unsupported` that also
-    // carries a `result` settles success (the result branch), because the error/unsupported
-    // branches key on the value type. Pins the same precedence Android and RN pin behaviorally.
+    /// Outcome precedence: a non-string `error` or a coerced-string `unsupported` that also
+    /// carries a `result` settles success (the result branch), because the error/unsupported
+    /// branches key on the value type. Pins the same precedence Android and RN pin behaviorally.
     @Test
     func `a non-string error alongside a result settles success`() throws {
         let fixture = Fixture()
@@ -244,7 +280,12 @@ struct AdaBridgeHandlerRequestTests {
         fixture.handler.sendBridgeRequest(method: "getInfo", params: nil, to: fixture.webView) { results.append($0) }
         let id = try requestId(from: fixture.webView)
 
-        fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "error": NSNull(), "result": "ok"])
+        fixture.handler.handleBridgeMessage([
+            "type": "sdk.response",
+            "requestId": id,
+            "error": NSNull(),
+            "result": "ok",
+        ])
 
         guard case let .success(value) = try #require(results.first) else {
             Issue.record("expected success")
@@ -260,7 +301,12 @@ struct AdaBridgeHandlerRequestTests {
         fixture.handler.sendBridgeRequest(method: "getInfo", params: nil, to: fixture.webView) { results.append($0) }
         let id = try requestId(from: fixture.webView)
 
-        fixture.handler.handleBridgeMessage(["type": "sdk.response", "requestId": id, "unsupported": "true", "result": "ok"])
+        fixture.handler.handleBridgeMessage([
+            "type": "sdk.response",
+            "requestId": id,
+            "unsupported": "true",
+            "result": "ok",
+        ])
 
         guard case let .success(value) = try #require(results.first) else {
             Issue.record("expected success")
@@ -315,6 +361,20 @@ struct AdaBridgeHandlerRequestTests {
             Issue.record("expected failure with no live document")
             return
         }
+    }
+
+    @Test
+    func `triggerPlaybook timeout exceeds the web runtime budget`() throws {
+        let fixture = Fixture()
+        var timeout: TimeInterval?
+        fixture.handler.bridgeRequestTimeoutRunner = { delay, _ in timeout = delay }
+
+        fixture.handler.sendBridgeRequest(method: "triggerPlaybook", params: nil, to: fixture.webView) { _ in }
+
+        #expect(try #require(timeout) > 120)
+        #expect(timeout == 125)
+        fixture.handler.sendBridgeRequest(method: "getInfo", params: nil, to: fixture.webView) { _ in }
+        #expect(timeout == 35)
     }
 
     @Test

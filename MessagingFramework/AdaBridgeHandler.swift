@@ -286,6 +286,11 @@ public enum AdaBridgeRequestResult {
     /// web side's own `BRIDGE_REQUEST_TIMEOUT_MS` (30s) so a stalled call normally
     /// surfaces the runtime's `error` reply, and this is only the last resort.
     static let bridgeRequestTimeout: TimeInterval = 35
+    static let triggerPlaybookTimeout: TimeInterval = 125
+
+    static func bridgeRequestTimeout(for method: String) -> TimeInterval {
+        method == "triggerPlaybook" ? triggerPlaybookTimeout : bridgeRequestTimeout
+    }
 
     /// Cap on outstanding curated requests, mirroring React Native's
     /// `MAX_PENDING_BRIDGE_REQUESTS`. A host polling reads before `sdk.ready`
@@ -888,7 +893,7 @@ public enum AdaBridgeRequestResult {
             webView: webView,
             completion: completion,
         )
-        bridgeRequestTimeoutRunner(Self.bridgeRequestTimeout) { [weak self] in
+        bridgeRequestTimeoutRunner(Self.bridgeRequestTimeout(for: method)) { [weak self] in
             self?.settleBridgeRequest(requestId: requestId, result: .failure("Bridge request timed out"))
         }
 

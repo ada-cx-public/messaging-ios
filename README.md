@@ -34,7 +34,7 @@ Xcode:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.5.0"),
+    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.6.0"),
 ],
 targets: [
     .target(
@@ -47,7 +47,7 @@ targets: [
 ### CocoaPods
 
 ```ruby
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.5.0"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.6.0"
 ```
 
 ### Carthage
@@ -138,7 +138,7 @@ import AdaMessaging
 pod "AdaEmbedFramework"
 
 # After
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.5.0"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.6.0"
 ```
 
 ## Important Code Changes To Make
@@ -240,3 +240,9 @@ Before shipping a migration:
 - test the exact presentation mode you ship: modal, navigation push, or inline
 - confirm any event logging still receives SDK events
 - test `reset()` and `deleteHistory()` if your app exposes those actions
+
+### Start a Playbook
+
+`triggerPlaybook` starts an eligible Playbook with optional regular and sensitive metadata. This method is in Early Access.
+Enable programmatic control. Use the completion result to handle acceptance or refusal.
+See the [API reference](../../../product-docs/fern/versions/pages/messaging/ios/reference.mdx#triggerplaybook).

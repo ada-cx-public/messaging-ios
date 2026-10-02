@@ -103,6 +103,26 @@ public extension AdaWebHost {
         )
     }
 
+    func triggerPlaybook(
+        _ playbookId: String,
+        metaFields: [String: Any]? = nil,
+        sensitiveMetaFields: [String: Any]? = nil,
+        completion: ((AdaBridgeRequestResult) -> Void)? = nil,
+    ) {
+        var params: [String: Any] = ["playbookId": playbookId]
+        if let metaFields { params["metaFields"] = AdaWebHost.withReservedMetaFields(metaFields) }
+        if let sensitiveMetaFields {
+            sensitiveMetafields.merge(sensitiveMetaFields) { _, new in new }
+            refreshRetainedConfigScriptIfArmed()
+            params["sensitiveMetaFields"] = sensitiveMetaFields
+        }
+        performBridgeRequest(
+            method: "triggerPlaybook",
+            params: params,
+            completion: completion ?? { _ in },
+        )
+    }
+
     /// Triggers the greeting (`adaEmbed.triggerGreeting`). Pass a `handle` to
     /// greet as a different bot; omit it for the current one.
     func triggerGreeting(handle: String? = nil, completion: ((AdaBridgeRequestResult) -> Void)? = nil) {
@@ -182,7 +202,7 @@ public extension AdaWebHost {
         // in-flight timeout whenever the queue wait exceeded the 5s grace and report
         // "timed out before ready" for a request that did dispatch, dropping the real reply.
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + AdaBridgeHandler.bridgeRequestTimeout + 5,
+            deadline: .now() + AdaBridgeHandler.bridgeRequestTimeout(for: method) + 5,
         ) {
             if didDispatch { return }
             // Settle the completion, but do NOT free the pre-ready slot here: the queued
@@ -211,7 +231,7 @@ public extension AdaWebHost {
             // would otherwise leave the caller unsettled forever now that the queued-phase
             // backstop is disarmed.
             DispatchQueue.main.asyncAfter(
-                deadline: .now() + AdaBridgeHandler.bridgeRequestTimeout + 5,
+                deadline: .now() + AdaBridgeHandler.bridgeRequestTimeout(for: method) + 5,
             ) {
                 settleOnce(.failure("Bridge request timed out"))
             }

@@ -1442,7 +1442,7 @@ enum AdaWebHostLegacyCommandQueueTests {
         host.reset(resetChatHistory: true)
 
         let script = try #require(
-            webView.capturedScripts.last(where: { $0.contains("adaEmbed.reset") })
+            webView.capturedScripts.last(where: { $0.contains("adaEmbed.reset") }),
         )
         #expect(script.contains("\"sdkType\":\"IOS\""))
         #expect(script.contains("\"sdkSupportsDownloadLink\":true"))
@@ -1456,7 +1456,7 @@ enum AdaWebHostLegacyCommandQueueTests {
         host.reset(metaFields: MetaFields.Builder(), sensitiveMetaFields: MetaFields.Builder())
 
         let script = try #require(
-            webView.capturedScripts.last(where: { $0.contains("adaEmbed.reset") })
+            webView.capturedScripts.last(where: { $0.contains("adaEmbed.reset") }),
         )
         #expect(script.contains("\"sdkType\":\"IOS\""))
         #expect(script.contains("\"sdkSupportsDownloadLink\":true"))
@@ -1644,14 +1644,14 @@ enum AdaWebViewConfigScriptHarness {
         let getItemBody = if consumedMarker == "throws" {
             "throw new Error(\"storage disabled\");"
         } else if let consumedMarker {
-            "return key === \"__ada_identity_token_consumed__\" ? \(try jsLiteral(consumedMarker)) : null;"
+            try "return key === \"__ada_identity_token_consumed__\" ? \(jsLiteral(consumedMarker)) : null;"
         } else {
             "return null;"
         }
         context.evaluateScript(urlSearchParamsPolyfill)
-        context.evaluateScript(
-            "var window = { location: { origin: \(try jsLiteral(origin)), "
-                + "pathname: \(try jsLiteral(pathname)), search: \(try jsLiteral(search)) }, "
+        try context.evaluateScript(
+            "var window = { location: { origin: \(jsLiteral(origin)), "
+                + "pathname: \(jsLiteral(pathname)), search: \(jsLiteral(search)) }, "
                 + "sessionStorage: { getItem: function (key) { \(getItemBody) } } };",
         )
         context.evaluateScript(script.source)
@@ -2117,9 +2117,9 @@ enum AdaWebViewConfigSensitiveFieldsTests {
         // JSONSerialization escapes the path's slashes as \/, so assert the guard
         // markers, not the raw path literal; the execution tests prove the guard
         // resolves correctly.
-        for script in [
-            try #require(host.makeWebviewConfigScript()),
-            try #require(host.makeWebviewConfigScript(retainedOnly: true)),
+        for script in try [
+            #require(host.makeWebviewConfigScript()),
+            #require(host.makeWebviewConfigScript(retainedOnly: true)),
         ] {
             #expect(script.source.contains("sensitive-value"))
             #expect(script.source.contains("appUrl"))
@@ -2564,6 +2564,84 @@ enum AdaWebViewConfigScriptDisarmTests {
         #expect(sourcesAfterSecond.count == sourcesAfter.count)
         #expect(!sourcesAfterSecond.contains(where: { $0.contains("secret-jwt-token") }))
         #expect(sourcesAfterSecond.contains(where: { $0.contains("__ADA_WEBVIEW_CONFIG__") }))
+    }
+}
+
+@MainActor
+enum AdaWebHostTriggerPlaybookTests {
+    @Test
+    static func `triggerPlaybook queues its payload and retains credentials for reload`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            sensitiveMetafields: ["token": "A", "region": "us", "device_token": "device-A", "device_os": "IOS"],
+            deviceToken: "device-A",
+            environment: .production,
+            webSdk: .messaging,
+            enableProgrammaticControl: true,
+        )
+        defer { host.teardownWebView() }
+        // The load timeout retains the original WebView after the test replaces it.
+        host.webView?.stopLoading()
+        let webView = ScriptCapturingWebView.mounted(on: host)
+        host.webHostLoaded = false
+        host.triggerPlaybook(
+            "507f1f77bcf86cd799439011",
+            metaFields: ["count": 2, "enabled": true, "sdkType": "WEB"],
+            sensitiveMetaFields: ["cleared": NSNull(), "token": "B", "device_token": "device-B", "device_os": "WEB"],
+        )
+        #expect(webView.capturedScripts.isEmpty)
+        host.webHostLoaded = true
+        let script = try #require(webView.capturedScripts.last)
+        let command = try dispatchedCommand(from: script)
+        #expect(command["type"] as? String == "ada.request")
+        #expect(command["method"] as? String == "triggerPlaybook")
+        #expect(command["requestId"] is String)
+        let payload = try #require(command["params"] as? [String: Any])
+        #expect(payload["playbookId"] as? String == "507f1f77bcf86cd799439011")
+        let metaFields = try #require(payload["metaFields"] as? [String: Any])
+        #expect(metaFields["sdkType"] as? String == "IOS")
+        #expect(metaFields["sdkSupportsDownloadLink"] as? Bool == true)
+        #expect(metaFields["count"] as? Int == 2)
+        #expect(metaFields["enabled"] as? Bool == true)
+        let fields = try #require(payload["sensitiveMetaFields"] as? [String: Any])
+        #expect(fields["cleared"] is NSNull)
+        #expect(fields["token"] as? String == "B")
+        #expect(fields["device_token"] as? String == "device-B")
+        #expect(fields["device_os"] as? String == "WEB")
+        #expect(host.sensitiveMetafields["token"] as? String == "B")
+        #expect(host.sensitiveMetafields["region"] as? String == "us")
+        #expect(host.sensitiveMetafields["cleared"] is NSNull)
+        #expect(host.sensitiveMetafields["device_token"] as? String == "device-B")
+        #expect(host.sensitiveMetafields["device_os"] as? String == "WEB")
+        host.adaBridgeDidBecomeReady(host.bridgeHandler)
+        webView.capturedScripts.removeAll()
+        host.webHostLoaded = false
+        host.adaBridgeDidBecomeReady(host.bridgeHandler)
+        let commands = try webView.capturedScripts.map { try dispatchedCommand(from: $0) }
+        let sensitive = try #require(commands.last { $0["type"] as? String == "ada.setSensitiveMetaFields" })
+        let replay = try #require(sensitive["payload"] as? [String: Any])
+        let replayFields = try #require(replay["fields"] as? [String: Any])
+        #expect(replayFields["token"] as? String == "B")
+        #expect(replayFields["region"] as? String == "us")
+        #expect(replayFields["cleared"] is NSNull)
+        #expect(replayFields["device_token"] as? String == "device-B")
+        #expect(replayFields["device_os"] as? String == "WEB")
+    }
+
+    @Test
+    static func `triggerPlaybook reports unsupported on the remote legacy host`() {
+        weak var releasedHost: AdaWebHost?
+        autoreleasepool {
+            let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .legacy)
+            defer { host.teardownWebView() }
+            releasedHost = host
+            var unsupported = false
+            host.triggerPlaybook("507f1f77bcf86cd799439011") { result in
+                if case .unsupported = result { unsupported = true }
+            }
+            #expect(unsupported)
+        }
+        #expect(releasedHost == nil)
     }
 }
 
