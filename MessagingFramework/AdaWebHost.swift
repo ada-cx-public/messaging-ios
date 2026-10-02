@@ -134,10 +134,9 @@ public class AdaWebHost: NSObject {
 
     /// Opts this host into the Messaging runtime's programmatic-control API.
     ///
-    /// Off by default, so existing integrations are unchanged. While it is off, core rejects
-    /// `sdk.message.send`, `sdk.conversation.get`, `sdk.messages.get` and
-    /// `sdk.composerText.set` with `ProgrammaticControlNotEnabled` — an error naming a
-    /// `start()` option this SDK previously gave the host no way to set.
+    /// Off by default. While it is off, core rejects `sdk.quickReply.select`,
+    /// `sdk.message.send`, `sdk.conversation.get`, `sdk.messages.get`, and
+    /// `sdk.composerText.set` with `ProgrammaticControlNotEnabled`.
     ///
     /// Named to match the React Native wrapper and the web SDK's `adaSettings` key. Ignored
     /// on the Legacy runtime, which has no such gate.

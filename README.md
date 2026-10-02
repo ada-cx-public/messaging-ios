@@ -34,7 +34,7 @@ Xcode:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.4.2"),
+    .package(url: "https://github.com/ada-cx-public/messaging-ios.git", from: "1.5.0"),
 ],
 targets: [
     .target(
@@ -47,7 +47,7 @@ targets: [
 ### CocoaPods
 
 ```ruby
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.4.2"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.5.0"
 ```
 
 ### Carthage
@@ -138,7 +138,7 @@ import AdaMessaging
 pod "AdaEmbedFramework"
 
 # After
-pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.4.2"
+pod "AdaMessaging", :git => "https://github.com/ada-cx-public/messaging-ios", :tag => "1.5.0"
 ```
 
 ## Important Code Changes To Make
@@ -192,18 +192,30 @@ adaWebHost.reset(
 The [native auth bridge](../../docs/native-zendesk-chat-auth.md) echoes request IDs for token and null responses.
 The web runtime drops answers whose IDs do not match the pending request. Existing host callbacks need no change.
 
+For Zendesk Messaging handoffs, select the Messaging runtime. Return a JWT from your server through `zdChatterAuthCallback`.
+Sign the JWT with your Zendesk Messaging signing secret using HS256. Keep the secret on your server.
+
+Include the signing key ID in the `kid` header. Include the `scope: "user"`, `external_id`, and `exp` claims.
+Use an expiry time in Unix seconds. The `external_id` must be a non-empty string of at most 255 characters.
+It must not contain `/`, `?`, `#`, `%`, whitespace, or control characters.
+Send the required `external_id` claim and the optional `name`, `email`, and `email_verified` claims.
+Verified email linking requires the Messaging SDK.
+Ada uses the JWT's name and email for display and linking only with an email and boolean `email_verified: true`.
+Without a verified email, Ada uses only `external_id`.
+See [Authenticate end users](https://docs.ada.cx/docs/handoffs/zendesk/zendesk-messaging#authenticate-end-users) for claim storage, display, and matching rules.
+
+The Messaging runtime requests one token at startup, including when both Zendesk platforms are configured.
+Zendesk Messaging authentication does not require the Zendesk Chat feature. Existing Zendesk Chat callbacks need no changes.
+If the token is missing or invalid, the handoff uses an anonymous Sunshine user when no other identity mapping applies.
+Removing the Messaging signing secret also disables the stored Messaging identity.
+See the [Zendesk Messaging setup](../../../product-docs/fern/versions/pages/docs/handoffs/zendesk/zendesk-messaging.mdx#authenticate-end-users) for signing key configuration.
+
 - `openWebLinksInSafari` controls whether supported web links open in `SFSafariViewController`
-- `zdChatterAuthCallback` is supported for Zendesk Chat authentication flows on **both**
-  runtimes — the Legacy `adaEmbed.start` path and the Messaging bridge. Your callback is invoked
-  once per auth cycle, including the recurring refresh, and must call its completion handler
-  exactly once.
-- Leaving `zdChatterAuthCallback` unset behaves **differently per runtime**, so set it if your bot
-  uses authenticated Zendesk Chat. On **Messaging**, Ada resolves the handshake immediately rather
-  than burning its 10-second auth timeout, so the handoff proceeds unauthenticated instead of
-  stalling once per refresh cycle. On **Legacy** there is no such fast path: the injected
-  `adaEmbed.start` shim always installs the callback and posts to native, but native only answers
-  when your callback is set, so an unset callback leaves that handshake unanswered rather than
-  resolved
+- `zdChatterAuthCallback` authenticates Zendesk Chat and Zendesk Messaging handoffs on the Messaging runtime.
+  Zendesk Chat authentication also works on the Legacy runtime.
+  Call the completion handler once per request. Zendesk Chat also requests tokens for refresh; Messaging-only authentication has no refresh timer.
+- If `zdChatterAuthCallback` is unset, the Messaging runtime answers with a null token immediately.
+  On the Legacy runtime, an unset callback leaves the request unanswered.
 - `enableProgrammaticControl` (default `false`) opens core's programmatic-control gate on the
   Messaging runtime, which is otherwise closed and rejects programmatic requests. With it on you
   can drive a send: `AdaBridgeHandler` is public with a public `init()`, and its

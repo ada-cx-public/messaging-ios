@@ -307,6 +307,20 @@ public extension AdaWebHost {
         evalJS("adaEmbed.deleteHistory();")
     }
 
+    /// Select a quick reply by message ID and zero-based index.
+    ///
+    /// Messaging runtime only. Requires `enableProgrammaticControl: true`.
+    /// Queued until the runtime is ready. The legacy remote host page drops the call.
+    func selectQuickReply(messageId: String, index: Int) {
+        guard usesBridgeRuntime else {
+            debugPrint("[AdaWebHost] selectQuickReply is not supported on the legacy remote host page")
+            return
+        }
+        dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+            bridgeHandler.selectQuickReply(messageId: messageId, index: index, to: webView)
+        }
+    }
+
     /// Programmatically send a user message into the conversation.
     ///
     /// Messaging runtime only, and core rejects it with `ProgrammaticControlNotEnabled`

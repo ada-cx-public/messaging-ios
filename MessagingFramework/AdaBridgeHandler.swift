@@ -721,6 +721,15 @@ public enum AdaBridgeRequestResult {
         )
     }
 
+    /// Select a quick reply by message ID and zero-based index.
+    public func selectQuickReply(messageId: String, index: Int, to webView: WKWebView) {
+        dispatchCommand(
+            ["type": "ada.selectQuickReply", "payload": ["messageId": messageId, "index": index]],
+            to: webView,
+            ticket: captureDocumentTicket(for: webView),
+        )
+    }
+
     /// Programmatically send a user message into the conversation.
     public func sendMessage(_ body: String, to webView: WKWebView) {
         dispatchCommand(

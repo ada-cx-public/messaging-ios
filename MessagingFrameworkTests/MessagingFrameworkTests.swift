@@ -1003,6 +1003,17 @@ extension AdaBridgeHandlerTests {
         }
 
         @Test
+        func `selectQuickReply convenience method emits the message ID and index`() throws {
+            let handler = makeHandler()
+            let webView = ScriptCapturingWebView()
+            handler.selectQuickReply(messageId: "quick-reply-1", index: 2, to: webView)
+            let script = try #require(webView.capturedScripts.first)
+            #expect(script.contains("ada.selectQuickReply"))
+            #expect(script.contains("\"messageId\":\"quick-reply-1\""))
+            #expect(script.contains("\"index\":2"))
+        }
+
+        @Test
         func `sendMessage convenience method emits correct type and body`() throws {
             let handler = makeHandler()
             let webView = ScriptCapturingWebView()
@@ -2558,6 +2569,41 @@ enum AdaWebViewConfigScriptDisarmTests {
 
 @MainActor
 enum AdaWebHostSendMessageTests {
+    @Test
+    static func `bridge runtime queues selectQuickReply until sdk ready`() throws {
+        let host = AdaWebHost(
+            handle: "ada-example",
+            environment: .production,
+            webSdk: .messaging,
+            enableProgrammaticControl: true,
+        )
+        let webView = ScriptCapturingWebView.mounted(on: host)
+        host.webHostLoaded = false
+
+        host.selectQuickReply(messageId: "quick-reply-1", index: 2)
+        #expect(webView.capturedScripts.isEmpty)
+
+        host.webHostLoaded = true
+        let script = try #require(webView.capturedScripts.last)
+        #expect(script.contains("ada.selectQuickReply"))
+        #expect(script.contains("\"messageId\":\"quick-reply-1\""))
+        #expect(script.contains("\"index\":2"))
+
+        host.selectQuickReply(messageId: "quick-reply-2", index: 0)
+        #expect(webView.capturedScripts.last?.contains("quick-reply-2") == true)
+    }
+
+    @Test
+    static func `legacy remote host page drops selectQuickReply`() {
+        let host = AdaWebHost(handle: "ada-example", environment: .production, webSdk: .legacy)
+        let webView = ScriptCapturingWebView.mounted(on: host)
+        host.webHostLoaded = true
+
+        host.selectQuickReply(messageId: "quick-reply-1", index: 0)
+
+        #expect(!webView.capturedScripts.contains(where: { $0.contains("ada.selectQuickReply") }))
+    }
+
     @Test
     static func `bridge runtime queues sendMessage until sdk ready`() throws {
         let host = AdaWebHost(
