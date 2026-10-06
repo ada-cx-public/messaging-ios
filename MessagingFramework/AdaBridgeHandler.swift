@@ -58,6 +58,7 @@ import WebKit
 struct AdaDocumentTicket: Equatable {
     let webView: ObjectIdentifier
     let documentUrl: String
+    var contentProcessGeneration: UInt64 = 0
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +215,8 @@ public enum AdaBridgeRequestResult {
     /// natively-computed grammar or the message is dropped. `nil` fails
     /// closed: every mirror write and clear is dropped.
     var sessionMirrorRuntime: AdaSessionMirrorRuntime?
+
+    var contentProcessGeneration: UInt64 = 0
 
     /// WebView the session-mirror command replies are dispatched into — the
     /// `ada.sessionMirrorClearAck` and the pull `sdk.sessionMirror.seed` reply.
@@ -627,7 +630,10 @@ public enum AdaBridgeRequestResult {
               AdaWebHost.pageOrigin(ofUrl: documentUrl) == trustedOrigin,
               AdaWebHost.isRuntimeDocumentUrl(documentUrl, entryDocumentUrl: trustedDocumentUrl)
         else { return nil }
-        return AdaDocumentTicket(webView: ObjectIdentifier(webView), documentUrl: documentUrl)
+        return AdaDocumentTicket(
+            webView: ObjectIdentifier(webView), documentUrl: documentUrl,
+            contentProcessGeneration: contentProcessGeneration,
+        )
     }
 
     /// The only `evaluateJavaScript` call site in this class, so a new injection sink cannot

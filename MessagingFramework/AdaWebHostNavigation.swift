@@ -301,7 +301,19 @@ enum AdaNavigationPolicy: Equatable {
 // MARK: - WKNavigationDelegate & WKUIDelegate
 
 extension AdaWebHost: WKNavigationDelegate, WKUIDelegate {
-    public func webView(_: WKWebView, didCommit _: WKNavigation!) {
+    private func isTrustedRuntimeDocument(_ webView: WKWebView) -> Bool {
+        guard let url = webView.url?.absoluteString,
+              let entryDocumentUrl = entryDocumentUrl?.absoluteString
+        else { return false }
+        return Self.pageOrigin(ofUrl: url) == bridgeHandler.trustedOrigin
+            && Self.isRuntimeDocumentUrl(url, entryDocumentUrl: entryDocumentUrl)
+    }
+
+    public func webView(_ webView: WKWebView, didCommit _: WKNavigation!) {
+        if self.webView === webView {
+            loadWatchdog.reached(step: "navigationCommitted")
+            if isTrustedRuntimeDocument(webView) { hasDisplayedPage = true }
+        }
         // `didCommit` is the callback immediately before WebKit swaps in the new
         // main-frame document, so it is the first point the document any outstanding
         // curated requests (EXP-1225) were issued into is provably being replaced —
@@ -314,22 +326,50 @@ extension AdaWebHost: WKNavigationDelegate, WKUIDelegate {
         // still-live previous document could have answered. On the first load nothing
         // is pending, so this is a no-op; teardown still cancels separately.
         bridgeHandler.cancelPendingBridgeRequests(reason: "Ada runtime document was replaced")
+        guard self.webView === webView, contentProcessRecoveryFailed,
+              isTrustedRuntimeDocument(webView)
+        else { return }
+        restoreBridgeBindings(to: webView)
     }
 
     public func webView(_ webView: WKWebView, didFinish _: WKNavigation!) {
+        guard self.webView === webView, !contentProcessRecoveryPending,
+              isTrustedRuntimeDocument(webView) else { return }
+        stopLoadWatchdog()
+        hasDisplayedPage = true
+        contentProcessRecoveryInFlight = false
+        contentProcessRecoveryFailed = false
+        scheduleStableContentRecoveryReset(for: webView)
+        hasError = false
         let url = webView.url?.absoluteString ?? ""
         let event: [String: Any] = ["event_name": "ada.webview.loaded", "url": url]
         dispatchEventToSubscribers(event, rawData: rawSdkEventData(event))
         eventCallbacks?["*"]?(event)
     }
 
-    public func webView(_: WKWebView, didFailProvisionalNavigation _: WKNavigation!, withError error: Error) {
-        // Whena  reset method is built - we will need to set this back to false
+    public func webView(_ webView: WKWebView, didFailProvisionalNavigation _: WKNavigation!, withError error: Error) {
+        guard self.webView === webView else { return }
+        let navigationError = error as NSError
+        if navigationError.domain == NSURLErrorDomain, navigationError.code == NSURLErrorCancelled { return }
+        if navigationError.domain == WKError.errorDomain,
+           navigationError.code == WKError.webContentProcessTerminated.rawValue { return }
+        stopLoadWatchdog()
+        contentProcessRecoveryFailed = contentProcessRecoveryFailed || contentProcessRecoveryInFlight
+        contentProcessRecoveryInFlight = false
         hasError = true
         webViewLoadingErrorCallback?(AdaWebHostError.webViewFailedToLoad)
         let event: [String: Any] = ["event_name": "ada.webview.loadFailed", "error": error.localizedDescription]
         dispatchEventToSubscribers(event, rawData: rawSdkEventData(event))
         eventCallbacks?["*"]?(event)
+    }
+
+    public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard self.webView === webView else { return }
+        let navigationError = error as NSError
+        if navigationError.domain == NSURLErrorDomain, navigationError.code == NSURLErrorCancelled {
+            return
+        }
+        self.webView(webView, didFailProvisionalNavigation: navigation, withError: error)
     }
 
     /// Shared function to handle opening of urls

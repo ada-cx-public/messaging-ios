@@ -10,7 +10,8 @@ extension AdaWebHost: WKScriptMessageHandler {
     public func userContentController(_: WKUserContentController, didReceive message: WKScriptMessage) {
         let messageName = message.name
         if messageName == "embedReady" {
-            webHostLoaded = true
+            guard bridgeHandler.isTrustedSource(of: message) else { return }
+            markWebHostReady()
         } else if let webViewLoadingErrorCallback,
                   messageName == "chatFrameTimeoutCallbackHandler"
         {
@@ -246,16 +247,40 @@ extension AdaWebHost {
         }
     }
 
+    private func markWebHostReady() {
+        hasDisplayedPage = true
+        contentProcessRecoveryInFlight = false
+        contentProcessRecoveryFailed = false
+        hasError = false
+        stopLoadWatchdog()
+        if let webView { scheduleStableContentRecoveryReset(for: webView) }
+        webHostLoaded = true
+    }
+
     func returnToOnline() {
         guard !isInOfflineMode else { return }
-
         if let offlineVC = offlineViewController {
             offlineVC.view.removeFromSuperview()
             offlineViewController = nil
         }
 
-        // This should reset the webview if client is offline on launch
-        if !webHostLoaded {
+        if contentProcessRecoveryPending {
+            recoverContentProcessIfNeeded()
+            return
+        }
+
+        if contentProcessRecoveryInFlight || contentProcessRecoveryFailed || (!webHostLoaded && hasDisplayedPage) {
+            cancelContentRecoveryReset?()
+            cancelContentRecoveryReset = nil
+            contentProcessRecoveries = 0
+            contentProcessRecoveryFailed = false
+            hasError = false
+            contentProcessRecoveryPending = true
+            recoverContentProcessIfNeeded()
+            return
+        }
+
+        if !webHostLoaded, !hasDisplayedPage {
             setupWebView()
         }
     }
@@ -308,7 +333,7 @@ extension AdaWebHost: AdaBridgeDelegate {
             consumedIdentityToken = armed
         }
         disarmWebviewConfigScript()
-        webHostLoaded = true
+        markWebHostReady()
         let event: [String: Any] = ["event_name": "sdk.ready", "web_sdk": webSdk.rawValue]
         dispatchEventToSubscribers(event, rawData: rawSdkEventData(event))
         if let callbacks = eventCallbacks {

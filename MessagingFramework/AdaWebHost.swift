@@ -188,6 +188,23 @@ public class AdaWebHost: NSObject {
 
     /// Here's where we do our business
     var webView: WKWebView?
+    var loadWatchdog = AdaLoadWatchdog()
+    var scheduleContentRecoveryReset: AdaLoadWatchdog.Schedule = { delayMs, action in
+        let work = DispatchWorkItem { MainActor.assumeIsolated { action() } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delayMs / 1000, execute: work)
+        return { work.cancel() }
+    }
+
+    // Cancellation is thread-safe, and deinit is the final access.
+    nonisolated(unsafe) var cancelContentRecoveryReset: (() -> Void)?
+    var contentProcessRecoveries = 0
+    var contentProcessRecoveryPending = false
+    var contentProcessRecoveryInFlight = false
+    var contentProcessRecoveryFailed = false
+    var hasDisplayedPage = false
+    var applicationIsActive = UIApplication.shared.applicationState == .active
+    var observesApplicationLifecycle = false
+    var initialWebViewRequest: URLRequest?
 
     /// The document this mount points the WebView at — `sdk/webview.html` with this run's start
     /// parameters on the bridge runtime, `/mobile-sdk-webview/` on the legacy remote page. It is
@@ -417,6 +434,7 @@ public class AdaWebHost: NSObject {
     }
 
     deinit {
+        cancelContentRecoveryReset?()
         NotificationCenter.default.removeObserver(self)
         reachability?.stopNotifier()
     }

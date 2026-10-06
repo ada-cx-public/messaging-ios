@@ -33,6 +33,7 @@ extension AdaWebHost {
     }
 
     func setupWebView() {
+        stopLoadWatchdog()
         let wkPreferences = WKPreferences()
         wkPreferences.javaScriptCanOpenWindowsAutomatically = true
         let configuration = WKWebViewConfiguration()
@@ -46,7 +47,7 @@ extension AdaWebHost {
         entryDocumentUrl = resolveEntryDocumentUrl()
         registerMessageHandlers(on: userContentController)
 
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = makeRecoverableWebView(configuration: configuration)
         guard let webView else { return }
         bridgeHandler.sessionMirrorCommandWebView = webView
         webView.scrollView.isScrollEnabled = false
@@ -63,36 +64,17 @@ extension AdaWebHost {
             }
         #endif
 
+        startLoadWatchdog(for: webView)
         loadInitialRequest(into: webView, userContentController: userContentController)
-
-        let timeout = webViewTimeout
-        Task { @MainActor [weak self, webView] in
-            do {
-                try await Self.sleepForWebViewTimeout(timeout)
-            } catch {
-                return
-            }
-
-            guard let self else { return }
-            if !hasError, webView.isLoading {
-                webView.stopLoading()
-                webViewLoadingErrorCallback?(AdaWebHostError.webViewTimeout)
-            }
-        }
     }
 
-    /// Neutralizes the current WebView before a rebuild. `setupWebView()` only
-    /// overwrites `webView`/`webviewUserContentController`, and a replaced
-    /// `WKWebView` is NOT inert: detached, it keeps loading and executing JS
-    /// (the load-timeout Task retains it for the full `webViewTimeout`), so its
-    /// document would spend the single-use `identityToken` (401
-    /// `identity_token_already_used` for the document the customer actually
-    /// uses), fire a premature `sdk.ready` through the shared `bridgeHandler` —
-    /// disarming the NEW WebView's still-unconsumed config script and flushing
-    /// queued commands before the new bridge exists — and keep emitting
-    /// duplicate SDK events to customer callbacks. Every rebuild must tear the
-    /// predecessor down first.
+    /// Replaced `WKWebView` instances keep loading and running JS. They can spend the single-use `identityToken`,
+    /// causing 401 `identity_token_already_used`. They also emit duplicate SDK events. A premature `sdk.ready` through
+    /// the shared `bridgeHandler` removes the new config script and sends queued commands before the new bridge exists.
+    /// Tear down the previous WebView before each rebuild.
     func teardownWebView() {
+        stopLoadWatchdog()
+        resetContentProcessRecovery()
         if let controller = webviewUserContentController {
             // Cuts the orphan document's message path into the shared
             // bridgeHandler (and, on the legacy page, into self), and strips
@@ -121,8 +103,6 @@ extension AdaWebHost {
         bridgeHandler.trustedDocumentUrl = nil
 
         if let replacedWebView = webView {
-            // Also keeps the load-timeout Task's late `isLoading` check from
-            // reporting a false timeout for a WebView that no longer matters.
             replacedWebView.stopLoading()
             replacedWebView.navigationDelegate = nil
             replacedWebView.uiDelegate = nil
@@ -133,18 +113,6 @@ extension AdaWebHost {
         // Whatever readiness the replaced runtime reported died with it —
         // queue commands until the rebuilt runtime reports its own sdk.ready.
         webHostLoaded = false
-    }
-
-    private static func sleepForWebViewTimeout(_ timeout: TimeInterval) async throws {
-        if #available(iOS 16.0, *) {
-            try await Task.sleep(for: .seconds(timeout))
-        } else {
-            try await Task.sleep(nanoseconds: secondsToNanoseconds(timeout))
-        }
-    }
-
-    private static func secondsToNanoseconds(_ seconds: TimeInterval) -> UInt64 {
-        UInt64((max(0, seconds) * 1_000_000_000).rounded())
     }
 
     /// The document this mount points the WebView at, resolved once so the value pinned as the
@@ -264,9 +232,8 @@ extension AdaWebHost {
             userContentController.addUserScript(errorInterceptorScript())
 
             if let url = entryDocumentUrl {
-                setPreprodDemoCookieIfNeeded(environment: env, in: webView) {
-                    webView.load(self.buildWebviewRequest(url: url, environment: env))
-                }
+                let load = prepareEntryRequest(buildWebviewRequest(url: url, environment: env), into: webView)
+                setPreprodDemoCookieIfNeeded(environment: env, in: webView, completion: load)
             }
             return
         }
@@ -277,7 +244,7 @@ extension AdaWebHost {
             cachePolicy: .useProtocolCachePolicy,
             timeoutInterval: webViewTimeout,
         )
-        webView.load(webRequest)
+        loadEntryRequest(webRequest, into: webView)
     }
 
     private func setPreprodDemoCookieIfNeeded(
@@ -647,7 +614,6 @@ extension AdaWebHost {
         }
         return "\(scheme)://\(host)"
     }
-
 
     func buildWebviewRequest(url: URL, environment: AdaEnvironment) -> URLRequest {
         var request = URLRequest(url: url)
