@@ -351,6 +351,7 @@ extension AdaWebHost: AdaBridgeDelegate {
         if !sensitiveMetafields.isEmpty, let webView {
             bridgeHandler.setSensitiveMetaFields(sensitiveMetafields, to: webView)
         }
+        reportViewVisibility()
     }
 
     public func adaBridgeDidRequestZendeskChatterAuth(_ handler: AdaBridgeHandler) {

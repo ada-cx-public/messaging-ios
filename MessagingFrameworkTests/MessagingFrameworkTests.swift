@@ -1777,6 +1777,7 @@ enum AdaWebViewConfigScriptTests {
         let payload = try configPayload(from: script)
 
         #expect(payload["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(payload["nativeViewVisibilitySupported"] as? Bool == true)
         #expect(payload["identityToken"] == nil)
         #expect(payload["appUrl"] == nil)
     }
@@ -1958,6 +1959,7 @@ enum AdaWebViewConfigScriptTests {
 
         #expect(payload["identityToken"] == nil)
         #expect(payload["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(payload["nativeViewVisibilitySupported"] as? Bool == true)
     }
 
     /// A token holding JS-hostile characters must survive as data, not become code.
@@ -2006,7 +2008,7 @@ enum AdaWebViewConfigScriptTests {
 
     /// A token-only config withholds the credential from a later document but
     /// still re-advertises the mirror capability, so the retained payload carries
-    /// only `nativeSessionMirrorSupported` — no token, injectionId, or appUrl.
+    /// both native capabilities, without a token, injectionId, or appUrl.
     @Test
     static func `retained payload keeps only the capability for a token-only config`() throws {
         let host = AdaWebHost(
@@ -2023,6 +2025,7 @@ enum AdaWebViewConfigScriptTests {
         #expect(retained["injectionId"] == nil)
         #expect(retained["appUrl"] == nil)
         #expect(retained["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(retained["nativeViewVisibilitySupported"] as? Bool == true)
     }
 
     /// appUrl is plain config every document (re-)mount needs, so an appUrl-only
@@ -2182,6 +2185,7 @@ enum AdaWebViewConfigSensitiveFieldsTests {
 
         #expect(payload["sensitiveMetaFields"] == nil)
         #expect(payload["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(payload["nativeViewVisibilitySupported"] as? Bool == true)
     }
 
     /// grJTI/defect-3: the setter MERGES into the backing field (matching the web
@@ -2313,6 +2317,7 @@ enum AdaWebViewConfigScriptExecutionTests {
         let config = try #require(try runConfigScript(script, origin: trustedOrigin))
 
         #expect(config["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(config["nativeViewVisibilitySupported"] as? Bool == true)
         #expect(config["nativeSessionMirrorSupported"] as? String == nil)
     }
 
@@ -2329,6 +2334,7 @@ enum AdaWebViewConfigScriptExecutionTests {
         #expect(config["identityToken"] == nil)
         #expect(config["appUrl"] as? String == "https://apps.example.com/custom-app/index.html")
         #expect(config["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(config["nativeViewVisibilitySupported"] as? Bool == true)
     }
 
     @Test
@@ -2389,6 +2395,7 @@ enum AdaWebViewConfigScriptExecutionTests {
         #expect(config["injectionId"] == nil)
         #expect(config["appUrl"] as? String == "https://apps.example.com/custom-app/index.html")
         #expect(config["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(config["nativeViewVisibilitySupported"] as? Bool == true)
     }
 
     /// A different document on the same origin (another html path) must not receive the
@@ -2492,6 +2499,7 @@ enum AdaWebViewConfigScriptExecutionTests {
         #expect(config["sensitiveMetaFields"] == nil)
         #expect(config["appUrl"] as? String == "https://apps.example.com/custom-app/index.html")
         #expect(config["nativeSessionMirrorSupported"] as? Bool == true)
+        #expect(config["nativeViewVisibilitySupported"] as? Bool == true)
     }
 
     /// A different document on the same origin (another html path) must not receive

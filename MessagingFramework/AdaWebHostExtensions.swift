@@ -441,7 +441,7 @@ extension AdaWebHost {
         // re-deliver on every same-origin document, so they ride the origin-only
         // guard. The credential (sensitiveMetaFields) is layered in separately below,
         // bound to THIS mount's document.
-        var baseRetained: [String: Any] = ["nativeSessionMirrorSupported": true]
+        var baseRetained: [String: Any] = ["nativeSessionMirrorSupported": true, "nativeViewVisibilitySupported": true]
         let trimmedAppUrl = appUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedAppUrl.isEmpty {
             baseRetained["appUrl"] = trimmedAppUrl
