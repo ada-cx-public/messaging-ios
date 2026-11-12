@@ -414,7 +414,7 @@ extension AdaWebHost {
 
         var trimmedIdentityToken = identityToken.trimmingCharacters(in: .whitespacesAndNewlines)
         // A retained-only re-arm (post-`sdk.ready`) never carries the one-shot identity
-        // token, only the per-document config (sensitiveMetaFields/appUrl/mirror flag).
+        // token, only the per-document config (sensitiveMetaFields/appUrl/branding/mirror flag).
         if retainedOnly {
             trimmedIdentityToken = ""
         }
@@ -428,23 +428,18 @@ extension AdaWebHost {
             )
             trimmedIdentityToken = ""
         }
-        // Native-capability handshake (EXP-1082): only a native version that
-        // implements the sdk.session.mirror(Clear) handlers and emits
-        // ada.sessionMirrorClearAck advertises support, so the CDN web runtime —
-        // instant and unversioned — arms the mirror + durable-clear barrier only
-        // inside this version or newer. Older wrappers omit the field, the SDK
-        // reads it absent, and the mirror degrades cleanly to pre-EXP-1082
-        // behavior. A real JSON boolean, not a string: the SDK gate compares
-        // `=== true`. Kept in `retainedConfig` so it rides every document (and
-        // folds into `fullConfig` below), exactly like `appUrl`.
-        // appUrl and the mirror flag are plain (non-credential) config that must
-        // re-deliver on every same-origin document, so they ride the origin-only
-        // guard. The credential (sensitiveMetaFields) is layered in separately below,
-        // bound to THIS mount's document.
+        // Branding, appUrl, and native capabilities must reach later documents after
+        // token consumption. Sensitive metafields use a separate document-bound guard.
         var baseRetained: [String: Any] = ["nativeSessionMirrorSupported": true, "nativeViewVisibilitySupported": true]
         let trimmedAppUrl = appUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedAppUrl.isEmpty {
             baseRetained["appUrl"] = trimmedAppUrl
+            if !appUrlFallback { baseRetained["appUrlFallback"] = false }
+        }
+
+        let trimmedBranding = branding.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedBranding.isEmpty {
+            baseRetained["branding"] = trimmedBranding
         }
 
         guard !trimmedIdentityToken.isEmpty || !baseRetained.isEmpty,
@@ -655,6 +650,7 @@ extension AdaWebHost {
         if enableProgrammaticControl, webSdk == .messaging {
             queryItems.append(URLQueryItem(name: "enableProgrammaticControl", value: "true"))
         }
+        queryItems.append(contentsOf: messagingStartQueryItems())
         if headless, webSdk == .messaging {
             queryItems.append(URLQueryItem(name: "headless", value: "true"))
         }

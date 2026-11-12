@@ -732,6 +732,15 @@ public enum AdaBridgeRequestResult {
         )
     }
 
+    /// Changes the display language and formatting locale for Messaging.
+    public func setLanguage(_ language: String, locale: String, to webView: WKWebView) {
+        dispatchCommand(
+            ["type": "ada.setLanguage", "payload": ["language": language, "locale": locale]],
+            to: webView,
+            ticket: captureDocumentTicket(for: webView),
+        )
+    }
+
     /// Select a quick reply by message ID and zero-based index.
     public func selectQuickReply(messageId: String, index: Int, to webView: WKWebView) {
         dispatchCommand(
@@ -776,7 +785,31 @@ public enum AdaBridgeRequestResult {
         resetChatHistory: Bool? = true,
         to webView: WKWebView,
     ) {
+        reset(
+            identityToken: nil,
+            language: language,
+            greeting: greeting,
+            metaFields: metaFields,
+            sensitiveMetaFields: sensitiveMetaFields,
+            resetChatHistory: resetChatHistory,
+            to: webView,
+        )
+    }
+
+    /// Resets Messaging with a one-use identity token and an optional greeting override.
+    public func reset(
+        identityToken: String?,
+        skipGreeting: Bool? = nil,
+        language: String? = nil,
+        greeting: String? = nil,
+        metaFields: [String: Any]? = nil,
+        sensitiveMetaFields: [String: Any]? = nil,
+        resetChatHistory: Bool? = true,
+        to webView: WKWebView,
+    ) {
         var payload: [String: Any] = [:]
+        if let identityToken { payload["identityToken"] = identityToken }
+        if let skipGreeting { payload["skipGreeting"] = skipGreeting }
         if let language { payload["language"] = language }
         if let greeting { payload["greeting"] = greeting }
         if let metaFields { payload["metaFields"] = metaFields }

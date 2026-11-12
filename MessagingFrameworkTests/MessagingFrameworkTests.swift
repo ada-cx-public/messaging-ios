@@ -3643,3 +3643,242 @@ enum AdaWebHostClearPersistedStateTests {
         #expect(host.bridgeHandler.makeInitialStateScript() == nil)
     }
 }
+
+@Suite(.serialized)
+@MainActor
+enum AdaWebHostBrandingInjectionTests {
+    @Test
+    static func `retains branding after the token is spent without a URL parameter`() throws {
+        let branding = ##"{"aiAgentName":{"en":"C++ Support"},"avatarUrl":"https://example.test/a+b.png"}"##
+        let host = AdaWebHost(
+            handle: "branch",
+            branding: "  \(branding)  ",
+            environment: .production,
+            webSdk: .messaging,
+            identityToken: "test-token",
+        )
+        defer { host.teardownWebView() }
+        let url = try #require(host.entryDocumentUrl)
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        #expect(components.queryItems?.first(where: { $0.name == "branding" }) == nil)
+        for retainedOnly in [false, true] {
+            let script = try #require(host.makeWebviewConfigScript(retainedOnly: retainedOnly))
+            for marker in [nil, AdaWebHost.identityTokenInjectionId("test-token")] {
+                let config = try #require(try AdaWebViewConfigScriptHarness.run(
+                    script,
+                    origin: "https://messaging-assets.ada.support",
+                    search: "?handle=branch",
+                    consumedMarker: marker,
+                ))
+                #expect(config["branding"] as? String == branding)
+                #expect((config["identityToken"] != nil) == (!retainedOnly && marker == nil))
+            }
+        }
+    }
+
+    @Test(arguments: ["", " ", "{}", "not-json", "null", "[]", "42", "{tintColor:'#123456'}"])
+    static func `omits blanks and forwards all other strings for strict web parsing`(branding: String) throws {
+        let host = AdaWebHost(handle: "branch", branding: branding, environment: .production, webSdk: .messaging)
+        defer { host.teardownWebView() }
+        let script = try #require(host.makeWebviewConfigScript())
+        let config = try #require(try AdaWebViewConfigScriptHarness.run(
+            script,
+            origin: "https://messaging-assets.ada.support",
+            search: "?handle=branch",
+        ))
+        let trimmed = branding.trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(config["branding"] as? String == (trimmed.isEmpty ? nil : trimmed))
+        #expect(host.entryDocumentUrl?.absoluteString.contains("branding=") == false)
+    }
+
+    @Test
+    static func `omits branding from the legacy URL and injected config`() throws {
+        let host = AdaWebHost(
+            handle: "branch",
+            branding: ##"{"tintColor":"#123456"}"##,
+            environment: .local(port: 4900),
+            webSdk: .legacy,
+        )
+        defer { host.teardownWebView() }
+        #expect(host.makeWebviewConfigScript() == nil)
+        #expect(host.entryDocumentUrl?.absoluteString.contains("branding=") == false)
+    }
+}
+
+@Suite(.serialized)
+@MainActor
+enum AdaWebHostParityTests {
+    @Test
+    static func `original initializer signature remains callable`() {
+        let initialize = AdaWebHost.init(
+            handle:cluster:language:domain:
+            styles:greeting:metafields:sensitiveMetafields:
+            openWebLinksInSafari:appScheme:zdChatterAuthCallback:webViewLoadingErrorCallback:
+            eventCallbacks:webViewTimeout:deviceToken:navigationBarOpaqueBackground:
+            environment:webSdk:enableProgrammaticControl:headless:
+            identityToken:appUrl:embedVersion:version:
+            preprodDemoToken:
+        )
+        let host = initialize(
+            "branch",
+            "",
+            "",
+            "",
+            "",
+            "",
+            [:],
+            [:],
+            false,
+            "",
+            nil,
+            nil,
+            nil,
+            30.0,
+            "",
+            false,
+            nil,
+            .messaging,
+            false,
+            false,
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+        defer { host.teardownWebView() }
+        #expect(host.branding.isEmpty)
+        #expect(!host.testMode)
+        #expect(!host.skipGreeting)
+        #expect(host.theme == nil)
+        #expect(host.locale.isEmpty)
+        #expect(host.appUrlFallback)
+        #expect(host.showFallbackOnTimeout)
+    }
+
+    @Test(arguments: [Double.nan, .infinity, -.infinity])
+    static func `trackEvent rejects nonfinite values before queueing`(value: Double) {
+        let host = AdaWebHost(handle: "branch", webSdk: .messaging)
+        defer { host.teardownWebView() }
+        var results: [AdaBridgeRequestResult] = []
+        host.trackEvent("checkout", value: value) { results.append($0) }
+        #expect(results.count == 1)
+        if case let .failure(message) = results.first {
+            #expect(message == "trackEvent value must be finite")
+        } else {
+            Issue.record("Expected a validation failure")
+        }
+        #expect(host.queuedBridgeRequestCount == 0)
+    }
+
+    @Test
+    static func `trackEvent rejects metadata that cannot be serialized`() {
+        let host = AdaWebHost(handle: "branch", webSdk: .messaging)
+        defer { host.teardownWebView() }
+        for meta: [String: Any] in [["nested": ["value": Double.nan]], ["object": NSObject()]] {
+            var results: [AdaBridgeRequestResult] = []
+            host.trackEvent("checkout", meta: meta) { results.append($0) }
+            #expect(results.count == 1)
+            if case let .failure(message) = results.first {
+                #expect(message == "trackEvent meta must be JSON-serializable")
+            } else {
+                Issue.record("Expected a validation failure")
+            }
+            #expect(host.queuedBridgeRequestCount == 0)
+        }
+    }
+
+    @Test(arguments: [AdaWebSdk.messaging, .legacy])
+    static func `start settings reach only Messaging`(webSdk: AdaWebSdk) throws {
+        let host = AdaWebHost(
+            handle: "branch", environment: .local(port: 4900), webSdk: webSdk,
+            appUrl: "https://example.test/app", testMode: true, skipGreeting: true,
+            theme: .dark, locale: "fr-CA", appUrlFallback: false, showFallbackOnTimeout: false,
+        )
+        defer { host.teardownWebView() }
+        let url = try #require(host.entryDocumentUrl)
+        let query = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+        for (key, value) in [
+            "testMode": "true", "skipGreeting": "true", "theme": "dark", "locale": "fr-CA",
+            "showFallbackOnTimeout": "false",
+        ] {
+            #expect(query.first { $0.name == key }?.value == (webSdk == .messaging ? value : nil))
+        }
+        #expect(query.first { $0.name == "enableProgrammaticControl" } == nil)
+        #expect(query.first { $0.name == "appUrlFallback" } == nil)
+        if webSdk == .messaging {
+            for retainedOnly in [false, true] {
+                let script = try #require(host.makeWebviewConfigScript(retainedOnly: retainedOnly))
+                let config = try #require(try AdaWebViewConfigScriptHarness.run(
+                    script, origin: "https://localhost:4900", search: "?handle=branch",
+                ))
+                #expect(config["appUrl"] as? String == "https://example.test/app")
+                #expect(config["appUrlFallback"] as? Bool == false)
+            }
+        } else {
+            #expect(host.makeWebviewConfigScript() == nil)
+        }
+    }
+
+    @Test
+    static func `new start defaults keep the existing transport`() throws {
+        let host = AdaWebHost(handle: "branch", environment: .production, webSdk: .messaging)
+        defer { host.teardownWebView() }
+        let url = try #require(host.entryDocumentUrl)
+        let query = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+        #expect(query.first { $0.name == "handle" }?.value == "branch")
+        for key in ["testMode", "skipGreeting", "theme", "locale", "showFallbackOnTimeout"] {
+            #expect(query.first { $0.name == key } == nil)
+        }
+        #expect(host.appUrlFallback)
+        #expect(!host.enableProgrammaticControl)
+    }
+
+    @Test
+    static func `trackEvent uses the correlated bridge without programmatic control`() throws {
+        let host = AdaWebHost(handle: "branch", environment: .production, webSdk: .messaging)
+        defer { host.teardownWebView() }
+        let webView = ScriptCapturingWebView.mounted(on: host)
+        host.webHostLoaded = true
+        host.trackEvent("checkout", value: 7, meta: ["order": "C++"])
+        let command = try dispatchedCommand(from: #require(webView.capturedScripts.last))
+        #expect(command["type"] as? String == "ada.request")
+        #expect(command["method"] as? String == "trackEvent")
+        let params = try #require(command["params"] as? [String: Any])
+        #expect(params["key"] as? String == "checkout")
+        #expect(params["value"] as? Double == 7)
+        #expect((params["meta"] as? [String: String]) == ["order": "C++"])
+        host.trackEvent("visit")
+        let optional = try dispatchedCommand(from: #require(webView.capturedScripts.last))
+        #expect((optional["params"] as? [String: String]) == ["key": "visit"])
+    }
+
+    @Test(arguments: [AdaWebSdk.messaging, .legacy])
+    static func `reset tokens stay in the command and locale is Messaging only`(webSdk: AdaWebSdk) throws {
+        let host = AdaWebHost(handle: "branch", environment: .local(port: 4900), webSdk: webSdk)
+        defer { host.teardownWebView() }
+        let webView = ScriptCapturingWebView.mounted(on: host)
+        host.webHostLoaded = true
+        host.reset(identityToken: "one-use-reset-token", skipGreeting: true, resetChatHistory: false)
+        let command = try dispatchedCommand(from: #require(webView.capturedScripts.last))
+        let payload = try #require(command["payload"] as? [String: Any])
+        #expect(payload["resetChatHistory"] as? Bool == false)
+        #expect(payload["identityToken"] as? String == (webSdk == .messaging ? "one-use-reset-token" : nil))
+        #expect(payload["skipGreeting"] as? Bool == (webSdk == .messaging ? true : nil))
+        #expect(host.identityToken.isEmpty)
+        #expect(host.makeWebviewConfigScript(retainedOnly: true)?.source.contains("one-use-reset-token") != true)
+        #expect(host.entryDocumentUrl?.absoluteString.contains("one-use-reset-token") == false)
+        host.reset(skipGreeting: false)
+        let skipped = try dispatchedCommand(from: #require(webView.capturedScripts.last))
+        #expect((skipped["payload"] as? [String: Any])?["identityToken"] == nil)
+        let skippedPayload = try #require(skipped["payload"] as? [String: Any])
+        #expect(skippedPayload["skipGreeting"] as? Bool == (webSdk == .messaging ? false : nil))
+        host.setLanguage(language: "fr", locale: "fr-CA")
+        let language = try dispatchedCommand(from: #require(webView.capturedScripts.last))
+        #expect((language["payload"] as? [String: String]) == (webSdk == .messaging
+            ? ["language": "fr", "locale": "fr-CA"] : ["language": "fr"]))
+        host.reset()
+        let old = try dispatchedCommand(from: #require(webView.capturedScripts.last))
+        #expect((old["payload"] as? [String: Bool]) == ["resetChatHistory": true])
+    }
+}

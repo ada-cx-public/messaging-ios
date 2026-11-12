@@ -149,6 +149,27 @@ public extension AdaWebHost {
         )
     }
 
+    /// Records a business event in Messaging once an end user session exists. Does not require programmatic control.
+    func trackEvent(
+        _ key: String,
+        value: Double? = nil,
+        meta: [String: Any]? = nil,
+        completion: ((AdaBridgeRequestResult) -> Void)? = nil,
+    ) {
+        guard value?.isFinite != false else {
+            completion?(.failure("trackEvent value must be finite"))
+            return
+        }
+        if let meta, !JSONSerialization.isValidJSONObject(meta) {
+            completion?(.failure("trackEvent meta must be JSON-serializable"))
+            return
+        }
+        var params: [String: Any] = ["key": key]
+        if let value { params["value"] = value }
+        if let meta { params["meta"] = meta }
+        performBridgeRequest(method: "trackEvent", params: params, completion: completion ?? { _ in })
+    }
+
     // -----------------------------------------------------------------------
     // MARK: - Dispatch
 

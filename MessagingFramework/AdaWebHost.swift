@@ -89,6 +89,10 @@ public class AdaWebHost: NSObject {
     /// the `sdk/webview.html` URL, and any other shape is dropped with a debug
     /// log. Read during init — set this at init.
     public var styles = ""
+    /// Appearance overrides for Messaging only, as a JSON object string.
+    /// See the web SDK branding reference for the field list.
+    /// Read during init. Set this at init.
+    public var branding = ""
     public var greeting = ""
     public var deviceToken = ""
     public var webViewTimeout = 30.0
@@ -167,6 +171,24 @@ public class AdaWebHost: NSObject {
     /// alongside ``identityToken``. Read during init — set this at init.
     /// Ignored on the Legacy runtime.
     public var appUrl: String = ""
+
+    /// Mark Messaging sessions as test users. Set during init. Defaults to false.
+    public var testMode: Bool = false
+
+    /// Skip automatic Messaging greetings, including resets. Set during init. Defaults to false.
+    public var skipGreeting: Bool = false
+
+    /// Override the Messaging theme. Set during init. Defaults to the server theme.
+    public var theme: AdaChatTheme?
+
+    /// Set the Messaging formatting locale with a BCP 47 tag. Defaults to unset.
+    public var locale: String = ""
+
+    /// Allow the standard app if appUrl fails. Messaging only. Defaults to true.
+    public var appUrlFallback: Bool = true
+
+    /// Show the Messaging timeout fallback. Set during init. Defaults to true.
+    public var showFallbackOnTimeout: Bool = true
 
     /// Pins the legacy remote host page (`/mobile-sdk-webview/`) to a specific
     /// embed-2 build. Rendered as the `?__ada-embed-version=<sha>` query param
@@ -334,12 +356,26 @@ public class AdaWebHost: NSObject {
         ]) { _, reserved in reserved }
     }
 
+    func messagingStartQueryItems() -> [URLQueryItem] {
+        guard webSdk == .messaging else { return [] }
+        return [
+            testMode ? URLQueryItem(name: "testMode", value: "true") : nil,
+            skipGreeting ? URLQueryItem(name: "skipGreeting", value: "true") : nil,
+            theme.map { URLQueryItem(name: "theme", value: $0.rawValue) },
+            locale.isEmpty ? nil : URLQueryItem(name: "locale", value: locale),
+            showFallbackOnTimeout ? nil : URLQueryItem(name: "showFallbackOnTimeout", value: "false"),
+        ].compactMap(\.self)
+    }
+
+    /// Prefer the original overload when a source call uses only its labels.
+    @_disfavoredOverload
     public init(
         handle: String,
         cluster: String = "",
         language: String = "",
         domain: String = "",
         styles: String = "",
+        branding: String = "",
         greeting: String = "",
         metafields: [String: Any] = [:],
         sensitiveMetafields: [String: Any] = [:],
@@ -360,11 +396,18 @@ public class AdaWebHost: NSObject {
         embedVersion: String = "",
         version: String = "",
         preprodDemoToken: String = "",
+        testMode: Bool = false,
+        skipGreeting: Bool = false,
+        theme: AdaChatTheme? = nil,
+        locale: String = "",
+        appUrlFallback: Bool = true,
+        showFallbackOnTimeout: Bool = true,
     ) {
         self.handle = handle
         self.cluster = cluster
         self.language = language
         self.styles = styles
+        self.branding = branding
         self.domain = domain
         self.greeting = greeting
         self.metafields = AdaWebHost.withReservedMetaFields(metafields)
@@ -387,6 +430,12 @@ public class AdaWebHost: NSObject {
         self.embedVersion = embedVersion
         self.version = version
         self.preprodDemoToken = preprodDemoToken
+        self.testMode = testMode
+        self.skipGreeting = skipGreeting
+        self.theme = theme
+        self.locale = locale
+        self.appUrlFallback = appUrlFallback
+        self.showFallbackOnTimeout = showFallbackOnTimeout
 
         reachability = Reachability()
         super.init()
@@ -448,6 +497,71 @@ public class AdaWebHost: NSObject {
             subview.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             subview.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
+    }
+}
+
+public extension AdaWebHost {
+    convenience init(
+        handle: String,
+        cluster: String = "",
+        language: String = "",
+        domain: String = "",
+        styles: String = "",
+        greeting: String = "",
+        metafields: [String: Any] = [:],
+        sensitiveMetafields: [String: Any] = [:],
+        openWebLinksInSafari: Bool = false,
+        appScheme: String = "",
+        zdChatterAuthCallback: ((@escaping (_ token: String) -> Void) -> Void)? = nil,
+        webViewLoadingErrorCallback: ((Error) -> Void)? = nil,
+        eventCallbacks: [String: (_ event: [String: Any]) -> Void]? = nil,
+        webViewTimeout: Double = 30.0,
+        deviceToken: String = "",
+        navigationBarOpaqueBackground: Bool = false,
+        environment: AdaEnvironment? = nil,
+        webSdk: AdaWebSdk = .legacy,
+        enableProgrammaticControl: Bool = false,
+        headless: Bool = false,
+        identityToken: String = "",
+        appUrl: String = "",
+        embedVersion: String = "",
+        version: String = "",
+        preprodDemoToken: String = "",
+    ) {
+        self.init(
+            handle: handle,
+            cluster: cluster,
+            language: language,
+            domain: domain,
+            styles: styles,
+            branding: "",
+            greeting: greeting,
+            metafields: metafields,
+            sensitiveMetafields: sensitiveMetafields,
+            openWebLinksInSafari: openWebLinksInSafari,
+            appScheme: appScheme,
+            zdChatterAuthCallback: zdChatterAuthCallback,
+            webViewLoadingErrorCallback: webViewLoadingErrorCallback,
+            eventCallbacks: eventCallbacks,
+            webViewTimeout: webViewTimeout,
+            deviceToken: deviceToken,
+            navigationBarOpaqueBackground: navigationBarOpaqueBackground,
+            environment: environment,
+            webSdk: webSdk,
+            enableProgrammaticControl: enableProgrammaticControl,
+            headless: headless,
+            identityToken: identityToken,
+            appUrl: appUrl,
+            embedVersion: embedVersion,
+            version: version,
+            preprodDemoToken: preprodDemoToken,
+            testMode: false,
+            skipGreeting: false,
+            theme: nil,
+            locale: "",
+            appUrlFallback: true,
+            showFallbackOnTimeout: true,
+        )
     }
 }
 

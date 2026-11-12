@@ -127,6 +127,65 @@ public extension AdaWebHost {
         sensitiveMetaFields: [String: Any]? = nil,
         resetChatHistory: Bool? = true,
     ) {
+        resetSession(
+            language: language,
+            greeting: greeting,
+            metaFields: metaFields,
+            sensitiveMetaFields: sensitiveMetaFields,
+            resetChatHistory: resetChatHistory,
+        )
+    }
+
+    /// Resets Messaging with a fresh one-use identity token. The token is not retained for later loads.
+    func reset(
+        identityToken: String?,
+        skipGreeting: Bool? = nil,
+        language: String? = nil,
+        greeting: String? = nil,
+        metaFields: MetaFields.Builder? = nil,
+        sensitiveMetaFields: MetaFields.Builder? = nil,
+        resetChatHistory: Bool? = true,
+    ) {
+        resetSession(
+            language: language,
+            greeting: greeting,
+            metaFields: metaFields?.build().metaFields,
+            sensitiveMetaFields: sensitiveMetaFields?.build().metaFields,
+            resetChatHistory: resetChatHistory,
+            identityToken: identityToken,
+            skipGreeting: skipGreeting,
+        )
+    }
+
+    /// Resets Messaging with a greeting override for this reset. A start-time skipGreeting takes precedence.
+    func reset(
+        skipGreeting: Bool,
+        language: String? = nil,
+        greeting: String? = nil,
+        metaFields: MetaFields.Builder? = nil,
+        sensitiveMetaFields: MetaFields.Builder? = nil,
+        resetChatHistory: Bool? = true,
+    ) {
+        reset(
+            identityToken: nil,
+            skipGreeting: skipGreeting,
+            language: language,
+            greeting: greeting,
+            metaFields: metaFields,
+            sensitiveMetaFields: sensitiveMetaFields,
+            resetChatHistory: resetChatHistory,
+        )
+    }
+
+    private func resetSession(
+        language: String?,
+        greeting: String?,
+        metaFields: [String: Any]?,
+        sensitiveMetaFields: [String: Any]?,
+        resetChatHistory: Bool?,
+        identityToken: String? = nil,
+        skipGreeting: Bool? = nil,
+    ) {
         // A reset REPLACES the session's sensitive fields with the reset's value —
         // matching the web RESET handler (`newState.sensitiveMetaFields = payload`),
         // where an omitted value clears them. So the backing field the post-ready
@@ -136,8 +195,11 @@ public extension AdaWebHost {
         self.sensitiveMetafields = sensitiveMetaFields ?? [:]
         refreshRetainedConfigScriptIfArmed()
         if usesBridgeRuntime {
+            let messaging = webSdk == .messaging
             dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
                 bridgeHandler.reset(
+                    identityToken: messaging ? identityToken : nil,
+                    skipGreeting: messaging ? skipGreeting : nil,
                     language: language,
                     greeting: greeting,
                     metaFields: metaFields.map { AdaWebHost.withReservedMetaFields($0) },
@@ -397,6 +459,17 @@ public extension AdaWebHost {
     func clearPersistedStateDurably() -> Bool {
         bridgeHandler.clearPersistedState()
         return bridgeHandler.clearAllSessionMirrorsDurably()
+    }
+
+    /// Changes the Messaging language and formatting locale. Legacy changes only the language.
+    func setLanguage(language: String, locale: String) {
+        guard webSdk == .messaging else {
+            setLanguage(language: language)
+            return
+        }
+        dispatchBridgeCommandWhenReady { [bridgeHandler] webView in
+            bridgeHandler.setLanguage(language, locale: locale, to: webView)
+        }
     }
 
     func setLanguage(language: String) {
